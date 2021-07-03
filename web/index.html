@@ -1,0 +1,2254 @@
+<html lang="en">
+    <head>
+        <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bulma@0.9.2/css/bulma.min.css">
+        <script src="https://cdn.jsdelivr.net/npm/vue@2.6.12/dist/vue.js"></script>
+    </head>
+
+    <body>
+        <div id="root">
+            <div class="section">
+                <div class="box">
+                    <div class="container">
+                        <button class="button" type="button" 
+                            v-for="btn in Object.keys(animateBtns)" v-on:click="animate(btn)">
+                            {{ btn }}
+                        </button>
+                    </div>
+                    <div class="container is-flex" style="flex-wrap:wrap">
+                        <div v-for="screen of screens" style="margin:3px">
+                            <div>{{ screen.name }}</div>
+                            <canvas :id="screen.name+' map'" :width="screen.canvasWidth||160" :height="screen.canvasHeight||144"></canvas>
+                            <canvas v-if="screen.showTileData === true" canvas :id="screen.name+' data'" width="256" height="96"></canvas>
+                            <canvas v-if="screen.showTileData === true" canvas :id="screen.name+' data2'" width="256" height="96"></canvas>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <script>
+            let bankConv = function(bank, addr) {
+                if (bank === 0) return addr;
+                return (bank - 1) * 0x4000 + addr;
+            }
+
+            let printBytes = function(bytes) {
+                console.log(bytes.map(i => i.toString(16)).join(' '));
+            }
+
+            let wordIn = function(rom, addr) {
+                return (rom[addr+1]<<8)+rom[addr];
+            }
+
+            class Screen {
+                constructor(screenSpec, rom) {
+                    this.memory = new Array(0x10000).fill(0);
+                    this.vram1 = new Array(0x2000).fill(0);
+                    this.bgPalettes = new Array(0x40).fill(0);
+                    this.hiColorPalettes = new Array(0x2400).fill(0);
+                    this.skyColors = new Array(32).fill(0);
+                    this.rom = null;
+                    this.screenSpec = screenSpec;
+                    this.rom = rom;
+                    this.is8000 = screenSpec.is8000;
+                    this.animateIdx = screenSpec.animateStartIdx;
+                    this.canAnimate = false;
+                }
+
+                drawScreen() {
+                    let screen = this.screenSpec;
+                    let name = screen.name;
+                    let tiledata_canvas = `${name} data`;
+                    let tiledata2_canvas = `${name} data2`;
+                    let tilemap_canvas = `${name} map`;
+
+                    // Gen animated sources
+                    if (this.screenSpec.animated && this.canAnimate) {
+                        let animation = this.screenSpec.animateFunc(this.animateIdx++, this.rom);
+                        screen.sources = animation.sources;
+
+                        if (this.animateIdx > this.screenSpec.animateEndIdx) 
+                            this.animateIdx = this.screenSpec.animateStartIdx;
+                        screen.name = animation.name;
+                    }
+
+                    // set vram sources
+                    for (let i = 0; i < screen.sources.length; i++) {
+                        let [algo, bank, addr, dest, ...args] = screen.sources[i];
+                        this[algo](bankConv(bank, addr), dest, ...args);
+                    }
+
+                    this.drawBytes(this.memory.slice(0x8000, 0x9800), null, tiledata_canvas, 32, 32, 12, false);
+                    this.drawBytes(this.vram1.slice(0x0000, 0x1800), null, tiledata2_canvas, 32, 32, 12, false);
+                    let layoutBytes0 = this.populateLayout(0);
+                    let layoutBytes1 = this.populateLayout(1);
+                    this.drawBytes(
+                        layoutBytes0, layoutBytes1,
+                        tilemap_canvas, 32, 
+                        this.screenSpec.colsShown || 20, 
+                        this.screenSpec.rowsShown || 18, 
+                        screen.isGBC);
+
+                    if (this.screenSpec.animated && this.canAnimate) {
+                        setTimeout(this.drawScreen.bind(this), 1000./60. * (this.screenSpec.animateDelay||3));
+                    }
+                }
+
+                simpleCopy(addr, dest, numBytes, srcLoc, destLoc) {
+                    srcLoc = srcLoc || 'rom';
+                    destLoc = destLoc || 'memory';
+                    for (let i = 0; i < numBytes; i++)
+                        this[destLoc][dest+i] = this[srcLoc][addr+i];
+                }
+
+                screenCopy(addr, dest, srcLoc, destLoc, width, height) {
+                    srcLoc = srcLoc || 'rom';
+                    destLoc = destLoc || 'memory';
+                    width = width || 0x14;
+                    height = height || 0x12;
+                    for (let row = 0; row < height; row++) {
+                        for (let col = 0; col < width; col++) {
+                            this[destLoc][dest+row*0x20+col] = this[srcLoc][addr+row*width+col];
+                        }
+                    }
+                }
+
+                spriteCopy(addr, dest, yOffset, xOffset, isYFlipped) {
+                    let numTiles = this.rom[addr++];
+                    for (let i = 0; i < numTiles; i++) {
+                        let [y, x, tile, attr] = this.rom.slice(addr, addr+4);
+                        addr += 4;
+                        if (yOffset) y += yOffset;
+                        if (xOffset) x += xOffset;
+                        if (x >= 0x100) x -= 0x100;
+                        if (y >= 0x100) y -= 0x100;
+                        y /= 8; x /= 8;
+                        y = Math.floor(y); x = Math.floor(x);
+                        if (isYFlipped) {
+                            this.memory[0x9800+y*0x20+x] = tile+1;
+                            this.memory[0x9800+(y+1)*0x20+x] = tile;
+                        } else {
+                            this.memory[0x9800+y*0x20+x] = tile;
+                            this.memory[0x9800+(y+1)*0x20+x] = tile+1;
+                            
+                        }
+                        this.vram1[0x1800+y*0x20+x] = attr;
+                        this.vram1[0x1800+(y+1)*0x20+x] = attr;
+                    }
+                }
+
+                rankingsMetatiles() {
+                    let offset = bankConv(6, 0x598f);
+                    let metatilesPerRow = 16;
+                    for (let metatile = 0; metatile <= 113; metatile++) {
+                        let metatiles = this.rom.slice(offset+metatile*4, offset+(metatile+1)*4);
+                        let row = Math.floor(metatile/metatilesPerRow);
+                        let col = (metatile % metatilesPerRow)*2;
+                        this.memory[0x9800+row*0x40+col] = metatiles[0];
+                        this.memory[0x9800+row*0x40+col+1] = metatiles[1];
+                        this.memory[0x9800+row*0x40+0x20+col] = metatiles[2];
+                        this.memory[0x9800+row*0x40+0x20+col+1] = metatiles[3];
+                    }
+                    for (let i = 0x1800; i < 0x1c00; i++) {
+                        this.vram1[i] = 8;
+                    }
+                }
+
+                scrollCopy(addr, dest, width) {
+                    for (let i = 0; i < width; i++) {
+                        let row = Math.floor(i / 32);
+                        let col = i % 32;
+                        // copy 2 bytes to tile map and attr
+                        let mapTop = this.rom[addr+i];
+                        let mapBottom = this.rom[addr+i+width];
+                        let attrTop = this.rom[addr+i+width*2];
+                        let attrBottom = this.rom[addr+i+width*3];
+                        this.memory[dest+col+row*0x40] = mapTop;
+                        this.memory[dest+col+0x20+row*0x40] = mapBottom;
+                        this.vram1[dest-0x8000+col+row*0x40] = attrTop;
+                        this.vram1[dest-0x8000+col+0x20+row*0x40] = attrBottom;
+                    }
+                }
+
+                eventBox(addr, dest, startIdx, attr) {
+                    let attrDest = dest-0x8000;
+                    for (let i = 0; i < 7; i++) {
+                        this.memory[dest+i] = startIdx+i;
+                        this.vram1[attrDest+i] = attr;
+                        this.memory[dest+i+0x20] = startIdx+0x10+i;
+                        this.vram1[attrDest+i+0x20] = attr;
+                        this.memory[dest+i+0x40] = startIdx+7+i;
+                        this.vram1[attrDest+i+0x40] = attr;
+                        this.memory[dest+i+0x60] = startIdx+0x10+7+i;
+                        this.vram1[attrDest+i+0x60] = attr;
+                    }
+                }
+
+                /*setBytes(addr, dest, ...bytes) {
+                    for (let i = 0; i < bytes.length; i++)
+                        this.memory[dest+i] = bytes[i];
+                }
+
+                fillScreen() {
+                    for (let i = 0x9800; i < 0x9c00; i++)
+                        this.memory[i] = 0x2f;
+                }*/
+
+                skyColor(addr) {
+                    for (let i = 0; i < 32; i++) {
+                        let b1 = this.rom[addr+i*2];
+                        let b2 = this.rom[addr+i*2+1];
+                        let r = b1 & 0x1f;
+                        let g = (b1 >> 5)+((b2 & 3)<<3);
+                        let b = (b2 >> 2);
+                        this.skyColors[i] = [r*8, g*8, b*8];
+                    }
+                }
+
+                getTileData(idx, bank, force8800) {
+                    if (this.is8000 && !force8800) {
+                        let base = 0x8000 + idx*16;
+                        if (bank === 0)
+                            return this.memory.slice(base, base+16);
+                        return this.vram1.slice(idx*16, idx*16+16);
+                    }
+
+                    let base;
+                    if (idx >= 0x80) {
+                        base = 0x8800 + (idx-0x80) * 16;
+                    } else {
+                        base = 0x9000 + idx * 16;
+                    }
+                    if (bank === 0)
+                        return this.memory.slice(base, base+16);
+                    return this.vram1.slice(base-0x8000, base+16-0x8000);
+                }
+
+                populateLayout(bank) {
+                    if (!this.screenSpec.isHighColor) {
+                        return this.memory.slice(0x9800, 0x9c00).reduce(
+                            (prev, curr) => [...prev, ...this.getTileData(curr, bank)],
+                            []
+                        );
+                    }
+                    return this.memory.slice(0x9800, 0x9920).reduce(
+                        (prev, curr) => [...prev, ...this.getTileData(curr, bank)],
+                        []
+                    ).concat(this.memory.slice(0x9920, 0x9c00).reduce(
+                        (prev, curr) => [...prev, ...this.getTileData(curr, bank, true)],
+                        []
+                    ));
+                }
+
+                pal20hbytes(srcLoc) {
+                    let colBgPalettes = [];
+                    for (let paletteIdx = 0; paletteIdx < 4; paletteIdx++) {
+                        let palCols = [];
+                        for (let colIdx = 0; colIdx < 4; colIdx++) {
+                            let bgPalIdx = paletteIdx * 8 + colIdx * 2;
+                            let b1 = srcLoc[bgPalIdx];
+                            let b2 = srcLoc[bgPalIdx+1];
+                            let r = b1 & 0x1f;
+                            let g = (b1 >> 5)+((b2 & 3)<<3);
+                            let b = (b2 >> 2);
+                            palCols.push([r*8, g*8, b*8]);
+                        }
+                        colBgPalettes.push(palCols);
+                    }
+                    return colBgPalettes;
+                }
+
+                pal40hbytes(srcLoc) {
+                    let colBgPalettes = [];
+                    for (let paletteIdx = 0; paletteIdx < 8; paletteIdx++) {
+                        let palCols = [];
+                        for (let colIdx = 0; colIdx < 4; colIdx++) {
+                            let bgPalIdx = paletteIdx * 8 + colIdx * 2;
+                            let b1 = srcLoc[bgPalIdx];
+                            let b2 = srcLoc[bgPalIdx+1];
+                            let r = b1 & 0x1f;
+                            let g = (b1 >> 5)+((b2 & 3)<<3);
+                            let b = (b2 >> 2);
+                            palCols.push([r*8, g*8, b*8]);
+                        }
+                        colBgPalettes.push(palCols);
+                    }
+                    return colBgPalettes;
+                }
+
+                drawBytes(bytes, bytes2, canvas_id, numTilesPerRow, numTilesShownPerCol, numTilesShownPerRow, isGBC) {
+                    let canvas = document.getElementById(canvas_id);
+                    if (!canvas) return;
+                    let ctx = canvas.getContext("2d");
+
+                    let width = canvas.width, height = canvas.height;
+                    let myImageData = ctx.createImageData(width, height);
+                    let data = myImageData.data;
+
+                    let bgPalettes = [0xff, 0xaa, 0x55, 0x00].reverse();
+                    let colBgPalettes = [];
+                    let highColLYtoPalsMap = {};
+                    if (this.screenSpec.isHighColor) {
+                        let currPalOffset = 0;
+
+                        let currPals = this.pal40hbytes(this.hiColorPalettes.slice(currPalOffset, currPalOffset+0x40));
+                        for (let i = 0; i < 0x90; i++) {
+                            if (i === 0) {
+                                highColLYtoPalsMap[i] = currPals;
+                                currPalOffset += 0x20;
+                                continue;
+                            }
+
+                            let nextPals = this.pal20hbytes(this.hiColorPalettes.slice(currPalOffset, currPalOffset+0x20));
+                            currPalOffset += 0x20;
+
+                            if (i % 2 === 0) {
+                                currPals = [...nextPals, ...currPals.slice(4)];
+                            } else {
+                                currPals = [...currPals.slice(0, 4), ...nextPals];
+                            }
+
+                            highColLYtoPalsMap[i-1] = currPals;
+                            if (i === 0x8f)
+                                highColLYtoPalsMap[i] = currPals;
+                        }
+                    }
+                    else if (isGBC) {
+                        colBgPalettes = this.pal40hbytes(this.bgPalettes);
+                    }
+
+                    let numTiles = bytes.length / 16;
+                    let numTilesPerCanvasRow = width / 8;
+                    for (let i = 0; i < numTiles; i++) {
+                        let tileAttr = this.vram1[0x1800+i];
+                        let tileBytes;
+
+                        if ((tileAttr & 8) && bytes2 !== null) {
+                            tileBytes = bytes2.slice(i * 16, (i+1) * 16);
+                        } else {
+                            tileBytes = bytes.slice(i * 16, (i+1) * 16);
+                        }
+                        let row = Math.floor(i / numTilesPerRow);
+                        let col = i % numTilesPerRow;
+                        let baseTileAddr = 4 * (((row * numTilesPerCanvasRow) * 64) + (col * 8));
+
+                        if (col >= numTilesShownPerCol) continue;
+                        if (row >= numTilesShownPerRow) continue;
+                        
+                        // iterate through rows in tile
+                        for (let j = 0; j < 8; j++) {
+                            let LY = row * 8 + j;
+                            let b1, b2;
+
+                            if (tileAttr & 0x40) {
+                                b1 = tileBytes[(7-j)*2];
+                                b2 = tileBytes[(7-j)*2+1];
+                            } else {
+                                b1 = tileBytes[j*2];
+                                b2 = tileBytes[j*2+1];
+                            }
+
+                            if (tileAttr & 0x20) {
+                                b1 = parseInt(Array.from(b1.toString(2).padStart(8, '0')).reverse().join(''), 2);
+                                b2 = parseInt(Array.from(b2.toString(2).padStart(8, '0')).reverse().join(''), 2);
+                            }
+
+                            let baseRowAddr = baseTileAddr + 4 * (j * numTilesPerCanvasRow * 8);
+                            // iterate through bits
+                            for (let k = 0; k < 8; k++) {
+                                let colIdx = (b2 & 1) * 2 + (b1 & 1);
+                                let bitAddr = baseRowAddr + 4 * (7-k);
+                                
+                                if (this.screenSpec.isSkyColor) {
+                                    let skyRGB = this.skyColors[row];
+                                    data[bitAddr] = skyRGB[0];
+                                    data[bitAddr+1] = skyRGB[1];
+                                    data[bitAddr+2] = skyRGB[2];
+                                } else if (isGBC || this.screenSpec.isHighColor) {
+                                    let tilePalette = this.vram1[0x1800+i]&7;
+                                    if (this.screenSpec.isHighColor) {
+                                        colBgPalettes = highColLYtoPalsMap[LY];
+                                    }
+                                    let baseComps = colBgPalettes[tilePalette][colIdx];
+
+                                    data[bitAddr] = baseComps[0];
+                                    data[bitAddr+1] = baseComps[1];
+                                    data[bitAddr+2] = baseComps[2];
+                                } else {
+                                    let baseCol = bgPalettes[colIdx];
+                                    
+                                    data[bitAddr] = baseCol;
+                                    data[bitAddr+1] = baseCol;
+                                    data[bitAddr+2] = baseCol;
+                                }
+
+                                data[bitAddr+3] = 255;
+                                b1 >>= 1;
+                                b2 >>= 1;
+                            }
+                        }
+                    }
+                    ctx.putImageData(myImageData, 0, 0);
+                }
+            }
+
+            let app = new Vue({
+                el: '#root',
+                data: {
+                    uint8view: null,
+                    screenMap: {},
+                    animateBtns: {
+                        'Cyber Front': ['Cyber Front'],
+                        'Small Rect 1': ['Small Rect BG 1:', 'Small Rect OBJ 1:'],
+                        'Small Rect 2': ['Small Rect BG 2:', 'Small Rect OBJ 2:'],
+                        'Small Rect 3': ['Small Rect BG 3:', 'Small Rect OBJ 3:'],
+                        'Small Rect 4': ['Small Rect BG 4:', 'Small Rect OBJ 4:'],
+                        'Small Rect 5': ['Small Rect BG 5:', 'Small Rect OBJ 5:'],
+                        'BG Animation': ['BG Animation:'],
+                        'Small Rect 6-8': ['Small Rect BG 6-8:', 'Small Rect OBJ 6-8:'],
+                        'Anime': ['Anime Hi-col:'],
+                        'Game setup': ['Game Setup BG:', 'Game Setup Window:'],
+                        'Trains': ['Train images:', 'Train info:'],
+                        'In-game': ['In-game:'],
+                    },
+                    screens: [
+                        {
+                            name: "In-game:",
+                            sources: [],
+                            isGBC: true,
+
+                            animated: true,
+                            animateStartIdx: 0,
+                            animateEndIdx: 74 * 15,
+                            animateDelay: 2,
+                            animateFunc: function(idx, rom) {
+                                let section = Math.floor(idx/15);
+                                let animIdx = idx % 15;
+
+                                let offset = bankConv(8, 0x5fcb) + section * 2;
+                                let rightOffset = rom[offset] * 2 + 0x4000;
+                                let leftOffset = rom[offset+1] * 2 + 0x4000;
+                                rightOffset = bankConv(0xb, rightOffset);
+                                leftOffset = bankConv(0xb, leftOffset);
+
+                                rightSecAddr = wordIn(rom, rightOffset);
+                                leftSecAddr = wordIn(rom, leftOffset);
+                                rightAnimOffset = bankConv(0xb, rightSecAddr) + 4 * animIdx;
+                                leftAnimOffset = bankConv(0xb, leftSecAddr) + 4 * animIdx;
+
+                                let rightBank = rom[rightAnimOffset] + 0x100;
+                                let rightAddr = wordIn(rom, rightAnimOffset+1);
+                                let leftBank = rom[leftAnimOffset] + 0x100;
+                                let leftAddr = wordIn(rom, leftAnimOffset+1);
+                                return {
+                                    name: `In-game: ${idx}`,
+                                    sources: [
+                                        //['screenCopy', 0x94, 0x7000, 0x9800],
+                                        //['screenCopy', 0x94, 0x7168, 0x1800, 'rom', 'vram1'],
+                                        ['screenCopy', 0x94, 0x72d0, 0x9800],
+                                        ['screenCopy', 0x94, 0x7438, 0x1800, 'rom', 'vram1'],
+                                        ['simpleCopy', 0x94, 0x4000, 0x8000, 0x1800],
+                                        ['simpleCopy', 0x94, 0x5800, 0x0000, 0x1800, 'rom', 'vram1'],
+                                        ['simpleCopy', leftBank, leftAddr, 0x1000, 0x400, 'rom', 'vram1'],
+                                        ['simpleCopy', rightBank, rightAddr, 0x1400, 0x400, 'rom', 'vram1'],
+                                        ['simpleCopy', 0x94, 0x75a0, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                                    ],
+                                }
+                            }
+                        },
+                        {
+                            name: "In-game",
+                            sources: [
+                                ['screenCopy', 0x94, 0x7000, 0x9800],
+                                ['screenCopy', 0x94, 0x7168, 0x1800, 'rom', 'vram1'],
+                                //['screenCopy', 0x94, 0x72d0, 0x9800],
+                                //['screenCopy', 0x94, 0x7438, 0x1800, 'rom', 'vram1'],
+                                ['simpleCopy', 0x94, 0x4000, 0x8000, 0x1800],
+                                ['simpleCopy', 0x94, 0x5800, 0x0000, 0x1800, 'rom', 'vram1'],
+                                ['simpleCopy', 0x152, 0x4000, 0x1000, 0x400, 'rom', 'vram1'],
+                                ['simpleCopy', 0x152, 0x4000, 0x1400, 0x400, 'rom', 'vram1'],
+                                ['simpleCopy', 0x94, 0x75a0, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                        },
+                        {
+                            name: "Train images:",
+                            sources: [],
+                            isHighColor: true,
+                            rowsShown: 16,
+
+                            animated: true,
+                            animateStartIdx: 0,
+                            animateEndIdx: 99,
+                            animateDelay: 30,
+                            animateFunc: function(idx, rom) {
+                                let div3 = Math.floor(idx/3);
+                                let mod3 = idx % 3;
+                                let addr = [0x4000, 0x5400, 0x6800][mod3];
+                                return {
+                                    name: `Train images: ${idx}`,
+                                    sources: [
+                                        ['screenCopy', 0xb3, 0x6030, 0x9800, 'rom', 'memory', 0x14, 0x10],
+                                        ['screenCopy', 0xb3, 0x6170, 0x1800, 'rom', 'vram1', 0x14, 0x10],
+                                        ['simpleCopy', div3+0x71, addr, 0x8800, 0x1000],
+                                        ['simpleCopy', div3+0x71, addr+0x1000, 0x800, 0x400, 'rom', 'vram1'],
+                                        ['simpleCopy', 0x0d+idx, 0x3fc0, 0x0000, 0x2400, 'rom', 'hiColorPalettes'],
+                                    ]
+                                }
+                            }
+                        },
+                        {
+                            name: "Train info:",
+                            sources: [],
+                            isGBC: true,
+
+                            animated: true,
+                            animateStartIdx: 0,
+                            animateEndIdx: 99,
+                            animateDelay: 30,
+                            animateFunc: function(idx, rom) {
+                                let div3 = Math.floor(idx/3);
+                                let mod3 = idx % 3;
+                                let addr = [0x4000, 0x5400, 0x6800][mod3];
+                                let nameOffset = bankConv(6, 0x6ac0)+idx*3;
+                                let hdma5 = rom[nameOffset];
+                                let nameSrc = wordIn(rom, nameOffset+1);
+
+                                let sources = [
+                                    ['screenCopy', 0xa7, 0x4040, 0x9800, 'rom', 'memory', 0x14, 0x13],
+                                    ['screenCopy', 0xa7, 0x41bc, 0x1800, 'rom', 'vram1', 0x14, 0x13],
+                                    ['simpleCopy', idx+0xd, 0x7310, 0x97c0, 0x40],
+                                    ['simpleCopy', idx+0xd, 0x7350, 0x800, 0xe0, 'rom', 'vram1'],
+                                    ['simpleCopy', idx+0xd, 0x7450, 0x8e0, 0x120, 'rom', 'vram1'],
+                                    ['simpleCopy', idx+0xd, 0x7590, 0xa00, 0x120, 'rom', 'vram1'],
+                                    ['simpleCopy', idx+0xd, 0x76d0, 0xb20, 0x120, 'rom', 'vram1'],
+                                    ['simpleCopy', 0xbc, nameSrc, 0x1200, hdma5*0x10+0x10, 'rom', 'vram1'],
+                                    ['simpleCopy', 0xa7, 0x4000, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                                ]
+                                for (let i = 0; i < 14; i++) {
+                                    sources.push(['simpleCopy', idx+0xd, 0x6190+i*0x140, 0x8800+i*0x120, 0x120]);
+                                }
+                                return {
+                                    name: `Train info: ${idx}`,
+                                    sources: sources,
+                                }
+                            }
+                        },
+                        {
+                            name: "DMG",
+                            sources: [
+                                ['simpleCopy', 0xab, 0x5b10, 0x8000, 0x1800],
+                                ['screenCopy', 0xab, 0x7310, 0x9800],
+                            ],
+                        },
+                        {
+                            name: "Cyber Front",
+                            sources: [],
+                            isGBC: true,
+
+                            animated: true,
+                            animateStartIdx: 0,
+                            animateEndIdx: 6,
+                            animateFunc: function(idx, rom) {
+                                let palSrc = 0x7790+(6-idx)*0x18;
+                                return {
+                                    name: "Cyber Front",
+                                    sources: [
+                                        ['simpleCopy', 0xa0, 0x5cc0, 0x8000, 0x1800],
+                                        ['screenCopy', 0xa0, 0x74c0, 0x9800],
+                                        ['screenCopy', 0xa0, 0x7628, 0x1800, 'rom', 'vram1'],
+                                        ['simpleCopy', 0xa0, palSrc, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                                    ],
+                                }
+                            }
+                        },
+                        {
+                            name: "Taito Logo",
+                            sources: [
+                                ['simpleCopy', 0xa0, 0x4000, 0x8000, 0x1800],
+                                ['simpleCopy', 0xa0, 0x5800, 0x9800, 0x240],
+                                ['simpleCopy', 0xa0, 0x5a40, 0x1800, 0x240, 'rom', 'vram1'],
+                                ['simpleCopy', 0xa0, 0x5c80, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                            colsShown: 32,
+                            canvasWidth: 32 * 8,
+                        },
+                        {
+                            name: "Taito Train",
+                            sources: [
+                                ['simpleCopy', 0xa0, 0x4000, 0x8000, 0x1800],
+                                ['simpleCopy', 0xa0, 0x5c80, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                                ['spriteCopy', 0x93, 0x4ad7, 0x0000],
+                            ],
+                            isGBC: true,
+                            is8000: true,
+                        },
+                        {
+                            name: "Hi-col: 1",
+                            sources: [
+                                ['screenCopy', 0xbd, 0x4000, 0x9800],
+                                ['screenCopy', 0xbd, 0x4168, 0x1800, 'rom', 'vram1'],
+                                ['simpleCopy', 0x1ba, 0x4000, 0x8000, 0x1400],
+                                ['simpleCopy', 0x1ba, 0x6800, 0x0000, 0x2400, 'rom', 'hiColorPalettes'],
+                            ],
+                            is8000: true,
+                            isHighColor: true,
+                            rowsShown: 16,
+                        },
+                        {
+                            name: "Hi-col: 2",
+                            sources: [
+                                ['screenCopy', 0xbd, 0x4000, 0x9800],
+                                ['screenCopy', 0xbd, 0x4168, 0x1800, 'rom', 'vram1'],
+                                ['simpleCopy', 0x1ba, 0x5400, 0x8000, 0x1400],
+                                ['simpleCopy', 0x1bf, 0x6800, 0x0000, 0x2400, 'rom', 'hiColorPalettes'],
+                            ],
+                            is8000: true,
+                            isHighColor: true,
+                            rowsShown: 16,
+                        },
+                        {
+                            name: "Small Rect BG 1:",
+                            sources: [],
+                            isGBC: true,
+                            is8000: false,
+                            
+                            animated: true,
+                            animateStartIdx: 1,
+                            animateEndIdx: 0xb,
+                            animateFunc: function(idx, rom) {
+                                let offset = bankConv(9, 0x673d)+6*idx;
+                                let bgBank = 0x100+rom[offset];
+                                let bgAddr = rom[offset+1]+(rom[offset+2]<<8)
+                                let objBank = 0x100+rom[offset+3];
+                                let objAddr = rom[offset+4]+(rom[offset+5]<<8)
+                                return {
+                                    name: `Small Rect BG 1: ${idx}`,
+                                    sources: [
+                                        ['screenCopy', 0xbd, 0x50e0, 0x9800],
+                                        ['screenCopy', 0xbd, 0x5248, 0x1800, 'rom', 'vram1'],
+                                        ['simpleCopy', bgBank, bgAddr, 0x8000, 0x500],
+                                        ['simpleCopy', objBank, objAddr, 0x9300, 0x500],
+                                        ['simpleCopy', 0xbd, 0x57c2, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                                    ],
+                                }
+                            }
+                        },
+                        {
+                            name: "Small Rect OBJ 1:",
+                            sources: [],
+                            isGBC: true,
+                            is8000: true,
+                            
+                            animated: true,
+                            animateStartIdx: 1,
+                            animateEndIdx: 0xb,
+                            animateFunc: function(idx, rom) {
+                                let offset = bankConv(9, 0x673d)+6*idx;
+                                let bgBank = 0x100+rom[offset];
+                                let bgAddr = rom[offset+1]+(rom[offset+2]<<8)
+                                let objBank = 0x100+rom[offset+3];
+                                let objAddr = rom[offset+4]+(rom[offset+5]<<8)
+                                return {
+                                    name: `Small Rect OBJ 1: ${idx}`,
+                                    sources: [
+                                        ['simpleCopy', bgBank, bgAddr, 0x8000, 0x500],
+                                        ['simpleCopy', objBank, objAddr, 0x9300, 0x500],
+                                        ['simpleCopy', 0xbd, 0x57c2, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                                        ['spriteCopy', 0xbd, 0x5680, 0x0000, 0x20, 0x30],
+                                    ],
+                                }
+                            }
+                        },
+                        {
+                            name: "Green Train",
+                            sources: [
+                                ['simpleCopy', 0xbe, 0x4000, 0x8900, 0xf00],
+                                ['simpleCopy', 0xbe, 0x4f00, 0x1100, 0x700, 'rom', 'vram1'],
+                                ['screenCopy', 0xbd, 0x5a02, 0x9800, 'rom', 'memory', 0x16],
+                                ['screenCopy', 0xbd, 0x5b8e, 0x1800, 'rom', 'vram1', 0x16],
+                                ['simpleCopy', 0xbd, 0x59c2, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                            colsShown: 22,
+                            canvasWidth: 22 * 8,
+                        },
+                        {
+                            name: "Small Rect BG 2:",
+                            sources: [],
+                            isGBC: true,
+                            is8000: false,
+                            
+                            animated: true,
+                            animateStartIdx: 0xc,
+                            animateEndIdx: 0x15,
+                            animateFunc: function(idx, rom) {
+                                let offset = bankConv(9, 0x673d)+6*idx;
+                                let bgBank = 0x100+rom[offset];
+                                let bgAddr = rom[offset+1]+(rom[offset+2]<<8)
+                                let objBank = 0x100+rom[offset+3];
+                                let objAddr = rom[offset+4]+(rom[offset+5]<<8)
+                                return {
+                                    name: `Small Rect BG 2: ${idx}`,
+                                    sources: [
+                                        ['screenCopy', 0xbd, 0x50e0, 0x9800],
+                                        ['screenCopy', 0xbd, 0x5248, 0x1800, 'rom', 'vram1'],
+                                        ['simpleCopy', bgBank, bgAddr, 0x8000, 0x500],
+                                        ['simpleCopy', objBank, objAddr, 0x9300, 0x500],
+                                        ['simpleCopy', 0xbd, 0x5802, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                                    ],
+                                }
+                            }
+                        },
+                        {
+                            name: "Small Rect OBJ 2:",
+                            sources: [],
+                            isGBC: true,
+                            is8000: true,
+                            
+                            animated: true,
+                            animateStartIdx: 0xc,
+                            animateEndIdx: 0x15,
+                            animateFunc: function(idx, rom) {
+                                let offset = bankConv(9, 0x673d)+6*idx;
+                                let bgBank = 0x100+rom[offset];
+                                let bgAddr = rom[offset+1]+(rom[offset+2]<<8)
+                                let objBank = 0x100+rom[offset+3];
+                                let objAddr = rom[offset+4]+(rom[offset+5]<<8)
+                                return {
+                                    name: `Small Rect OBJ 2: ${idx}`,
+                                    sources: [
+                                        ['simpleCopy', bgBank, bgAddr, 0x8000, 0x500],
+                                        ['simpleCopy', objBank, objAddr, 0x9300, 0x500],
+                                        ['simpleCopy', 0xbd, 0x5802, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                                        ['spriteCopy', 0xbd, 0x5680, 0x0000, 0x20, 0x30],
+                                    ],
+                                }
+                            }
+                        },
+                        {
+                            name: "Purple Train Wheel",
+                            sources: [
+                                ['simpleCopy', 0xbf, 0x4000, 0x8900, 0xf00],
+                                ['simpleCopy', 0xbf, 0x4f00, 0x1100, 0x700, 'rom', 'vram1'],
+                                ['screenCopy', 0xbd, 0x5a02, 0x9800, 'rom', 'memory', 0x16],
+                                ['screenCopy', 0xbd, 0x5b8e, 0x1800, 'rom', 'vram1', 0x16],
+                                ['simpleCopy', 0xbd, 0x5d1a, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                            colsShown: 22,
+                            canvasWidth: 22 * 8,
+                        },
+                        {
+                            name: "Small Rect BG 3:",
+                            sources: [],
+                            isGBC: true,
+                            is8000: false,
+                            
+                            animated: true,
+                            animateStartIdx: 0x16,
+                            animateEndIdx: 0x20,
+                            animateFunc: function(idx, rom) {
+                                let offset = bankConv(9, 0x673d)+6*idx;
+                                let bgBank = 0x100+rom[offset];
+                                let bgAddr = rom[offset+1]+(rom[offset+2]<<8)
+                                let objBank = 0x100+rom[offset+3];
+                                let objAddr = rom[offset+4]+(rom[offset+5]<<8)
+                                return {
+                                    name: `Small Rect BG 3: ${idx}`,
+                                    sources: [
+                                        ['screenCopy', 0xbd, 0x50e0, 0x9800],
+                                        ['screenCopy', 0xbd, 0x5248, 0x1800, 'rom', 'vram1'],
+                                        ['simpleCopy', bgBank, bgAddr, 0x8000, 0x500],
+                                        ['simpleCopy', objBank, objAddr, 0x9300, 0x500],
+                                        ['simpleCopy', 0xbd, 0x5842, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                                    ],
+                                }
+                            }
+                        },
+                        {
+                            name: "Small Rect OBJ 3:",
+                            sources: [],
+                            isGBC: true,
+                            is8000: true,
+                            
+                            animated: true,
+                            animateStartIdx: 0x16,
+                            animateEndIdx: 0x20,
+                            animateFunc: function(idx, rom) {
+                                let offset = bankConv(9, 0x673d)+6*idx;
+                                let bgBank = 0x100+rom[offset];
+                                let bgAddr = rom[offset+1]+(rom[offset+2]<<8)
+                                let objBank = 0x100+rom[offset+3];
+                                let objAddr = rom[offset+4]+(rom[offset+5]<<8)
+                                return {
+                                    name: `Small Rect OBJ 3: ${idx}`,
+                                    sources: [
+                                        ['simpleCopy', bgBank, bgAddr, 0x8000, 0x500],
+                                        ['simpleCopy', objBank, objAddr, 0x9300, 0x500],
+                                        ['simpleCopy', 0xbd, 0x5842, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                                        ['spriteCopy', 0xbd, 0x5680, 0x0000, 0x20, 0x30],
+                                    ],
+                                }
+                            }
+                        },
+                        {
+                            name: "Credits 1 BG",
+                            sources: [
+                                ['simpleCopy', 0xc0, 0x4000, 0x8000, 0x1800],
+                                ['simpleCopy', 0xc0, 0x5800, 0x800, 0x1000, 'rom', 'vram1'],
+                                ['screenCopy', 0xbd, 0x5d9a, 0x9800],
+                                ['screenCopy', 0xbd, 0x5f02, 0x1800, 'rom', 'vram1'],
+
+                                ['screenCopy', 0xbd, 0x651a, 0x980c, 'rom', 'memory', 8, 3],
+                                ['screenCopy', 0xbd, 0x64d2, 0x9800, 'rom', 'memory', 12, 3],
+                                ['screenCopy', 0xbd, 0x6532, 0x180c, 'rom', 'vram1', 8, 3],
+                                ['screenCopy', 0xbd, 0x64f6, 0x1800, 'rom', 'vram1', 12, 3],
+
+                                ['screenCopy', 0xbd, 0x657a, 0x99e8, 'rom', 'memory', 12, 3],
+                                ['screenCopy', 0xbd, 0x654a, 0x99e0, 'rom', 'memory', 8, 3],
+                                ['screenCopy', 0xbd, 0x659e, 0x19e8, 'rom', 'vram1', 12, 3],
+                                ['screenCopy', 0xbd, 0x6562, 0x19e0, 'rom', 'vram1', 8, 3],
+                                
+                                ['simpleCopy', 0xbd, 0x5d5a, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                        },
+                        {
+                            name: "Credits 1 OBJ",
+                            sources: [
+                                ['simpleCopy', 0xc0, 0x4000, 0x8000, 0x1800],
+                                ['simpleCopy', 0xc0, 0x5800, 0x800, 0x1000, 'rom', 'vram1'],
+                                ['spriteCopy', 0xbd, 0x65c2, 0x0000, 0x20, 0x30],
+                                ['simpleCopy', 0xbd, 0x5d5a, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                            is8000: true,
+                        },
+                        {
+                            name: "Small Rect BG 4:",
+                            sources: [],
+                            isGBC: true,
+                            is8000: false,
+                            
+                            animated: true,
+                            animateStartIdx: 0x21,
+                            animateEndIdx: 0x2c,
+                            animateFunc: function(idx, rom) {
+                                let offset = bankConv(9, 0x673d)+6*idx;
+                                let bgBank = 0x100+rom[offset];
+                                let bgAddr = rom[offset+1]+(rom[offset+2]<<8)
+                                let objBank = 0x100+rom[offset+3];
+                                let objAddr = rom[offset+4]+(rom[offset+5]<<8)
+                                return {
+                                    name: `Small Rect BG 4: ${idx}`,
+                                    sources: [
+                                        ['screenCopy', 0xbd, 0x50e0, 0x9800],
+                                        ['screenCopy', 0xbd, 0x5248, 0x1800, 'rom', 'vram1'],
+                                        ['simpleCopy', bgBank, bgAddr, 0x8000, 0x500],
+                                        ['simpleCopy', objBank, objAddr, 0x9300, 0x500],
+                                        ['simpleCopy', 0xbd, 0x5882, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                                    ],
+                                }
+                            }
+                        },
+                        {
+                            name: "Small Rect OBJ 4:",
+                            sources: [],
+                            isGBC: true,
+                            is8000: true,
+                            
+                            animated: true,
+                            animateStartIdx: 0x21,
+                            animateEndIdx: 0x2c,
+                            animateFunc: function(idx, rom) {
+                                let offset = bankConv(9, 0x673d)+6*idx;
+                                let bgBank = 0x100+rom[offset];
+                                let bgAddr = rom[offset+1]+(rom[offset+2]<<8)
+                                let objBank = 0x100+rom[offset+3];
+                                let objAddr = rom[offset+4]+(rom[offset+5]<<8)
+                                return {
+                                    name: `Small Rect OBJ 4: ${idx}`,
+                                    sources: [
+                                        ['simpleCopy', bgBank, bgAddr, 0x8000, 0x500],
+                                        ['simpleCopy', objBank, objAddr, 0x9300, 0x500],
+                                        ['simpleCopy', 0xbd, 0x5882, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                                        ['spriteCopy', 0xbd, 0x5680, 0x0000, 0x20, 0x30],
+                                    ],
+                                }
+                            }
+                        },
+                        {
+                            name: "Large image",
+                            sources: [
+                                ['simpleCopy', 0xc1, 0x4000, 0x8800, 0x1000],
+                                ['simpleCopy', 0xc1, 0x5000, 0x800, 0x1000, 'rom', 'vram1'],
+                                ['screenCopy', 0xbd, 0x60aa, 0x9800, 'rom', 'memory', 0x19, 0x12],
+                                ['screenCopy', 0xbd, 0x626c, 0x1800, 'rom', 'vram1', 0x19, 0x12],
+                                ['screenCopy', 0xbd, 0x642e, 0x9a40, 'rom', 'memory', 0x19, 0x2],
+                                ['screenCopy', 0xbd, 0x6460, 0x1a40, 'rom', 'vram1', 0x19, 0x2],
+                                ['simpleCopy', 0xbd, 0x6492, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                            colsShown: 25,
+                            canvasWidth: 25 * 8,
+                            rowsShown: 20,
+                            canvasHeight: 20 * 8,
+                        },
+                        {
+                            name: "Small Rect BG 5:",
+                            sources: [],
+                            isGBC: true,
+                            is8000: false,
+                            
+                            animated: true,
+                            animateStartIdx: 0x2d,
+                            animateEndIdx: 0x36,
+                            animateFunc: function(idx, rom) {
+                                let offset = bankConv(9, 0x673d)+6*idx;
+                                let bgBank = 0x100+rom[offset];
+                                let bgAddr = rom[offset+1]+(rom[offset+2]<<8)
+                                let objBank = 0x100+rom[offset+3];
+                                let objAddr = rom[offset+4]+(rom[offset+5]<<8)
+                                return {
+                                    name: `Small Rect BG 5: ${idx}`,
+                                    sources: [
+                                        ['screenCopy', 0xbd, 0x50e0, 0x9800],
+                                        ['screenCopy', 0xbd, 0x5248, 0x1800, 'rom', 'vram1'],
+                                        ['simpleCopy', bgBank, bgAddr, 0x8000, 0x500],
+                                        ['simpleCopy', objBank, objAddr, 0x9300, 0x500],
+                                        ['simpleCopy', 0xbd, 0x58c2, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                                    ],
+                                }
+                            }
+                        },
+                        {
+                            name: "Small Rect OBJ 5:",
+                            sources: [],
+                            isGBC: true,
+                            is8000: true,
+                            
+                            animated: true,
+                            animateStartIdx: 0x2d,
+                            animateEndIdx: 0x36,
+                            animateFunc: function(idx, rom) {
+                                let offset = bankConv(9, 0x673d)+6*idx;
+                                let bgBank = 0x100+rom[offset];
+                                let bgAddr = rom[offset+1]+(rom[offset+2]<<8)
+                                let objBank = 0x100+rom[offset+3];
+                                let objAddr = rom[offset+4]+(rom[offset+5]<<8)
+                                return {
+                                    name: `Small Rect OBJ 5: ${idx}`,
+                                    sources: [
+                                        ['simpleCopy', bgBank, bgAddr, 0x8000, 0x500],
+                                        ['simpleCopy', objBank, objAddr, 0x9300, 0x500],
+                                        ['simpleCopy', 0xbd, 0x58c2, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                                        ['spriteCopy', 0xbd, 0x5680, 0x0000, 0x20, 0x30],
+                                    ],
+                                }
+                            }
+                        },
+                        {
+                            name: "Credits 2 BG",
+                            sources: [
+                                ['simpleCopy', 0xc2, 0x4000, 0x8000, 0x1800],
+                                ['simpleCopy', 0xc2, 0x5800, 0x800, 0x1000, 'rom', 'vram1'],
+                                ['screenCopy', 0xbd, 0x5d9a, 0x9800],
+                                ['screenCopy', 0xbd, 0x5f02, 0x1800, 'rom', 'vram1'],
+
+                                ['screenCopy', 0xbd, 0x651a, 0x980c, 'rom', 'memory', 8, 3],
+                                ['screenCopy', 0xbd, 0x64d2, 0x9800, 'rom', 'memory', 12, 3],
+                                ['screenCopy', 0xbd, 0x6532, 0x180c, 'rom', 'vram1', 8, 3],
+                                ['screenCopy', 0xbd, 0x64f6, 0x1800, 'rom', 'vram1', 12, 3],
+
+                                ['screenCopy', 0xbd, 0x657a, 0x99e8, 'rom', 'memory', 12, 3],
+                                ['screenCopy', 0xbd, 0x654a, 0x99e0, 'rom', 'memory', 8, 3],
+                                ['screenCopy', 0xbd, 0x659e, 0x19e8, 'rom', 'vram1', 12, 3],
+                                ['screenCopy', 0xbd, 0x6562, 0x19e0, 'rom', 'vram1', 8, 3],
+                                
+                                ['simpleCopy', 0xbd, 0x606a, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                        },
+                        {
+                            name: "Credits 2 OBJ",
+                            sources: [
+                                ['simpleCopy', 0xc2, 0x4000, 0x8000, 0x1800],
+                                ['simpleCopy', 0xc2, 0x5800, 0x800, 0x1000, 'rom', 'vram1'],
+                                ['spriteCopy', 0xbd, 0x65c2, 0x0000, 0x20, 0x30],
+                                ['simpleCopy', 0xbd, 0x606a, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                            is8000: true,
+                        },
+                        {
+                            name: "BG Animation:",
+                            sources: [],
+                            isGBC: true,
+
+                            animated: true,
+                            animateStartIdx: 1,
+                            animateEndIdx: 0x26,
+                            animateFunc: function(idx, rom) {
+                                let offset = bankConv(9, 0x66c8)+3*idx;
+                                let tileDataBank = 0x100+rom[offset];
+                                let tileDataAddr = rom[offset+1]+(rom[offset+2]<<8)
+                                let paletteSrc = 0x6763;
+                                if (idx >= 0xe) paletteSrc += 0x40;
+                                if (idx >= 0x1a) paletteSrc += 0x40;
+                                
+                                return {
+                                    name: `BG Animation: ${idx}`,
+                                    sources: [
+                                        ['screenCopy', 0xbd, 0x4b40, 0x9800],
+                                        ['screenCopy', 0xbd, 0x4ca8, 0x1800, 'rom', 'vram1'],
+                                        ['simpleCopy', tileDataBank, tileDataAddr, 0x8900, 0x4e0*3],
+                                        ['simpleCopy', 0xbd, paletteSrc, 0x0000, 0x2400, 'rom', 'bgPalettes'],
+                                    ],
+                                }
+                            }
+                        },
+                        {
+                            name: "Small Rect BG 6-8:",
+                            sources: [],
+                            isGBC: true,
+                            is8000: false,
+                            
+                            animated: true,
+                            animateStartIdx: 0x37,
+                            animateEndIdx: 0x48,
+                            animateFunc: function(idx, rom) {
+                                let offset = bankConv(9, 0x673d)+6*idx;
+                                let bgBank = 0x100+rom[offset];
+                                let bgAddr = rom[offset+1]+(rom[offset+2]<<8)
+                                let objBank = 0x100+rom[offset+3];
+                                let objAddr = rom[offset+4]+(rom[offset+5]<<8)
+                                let palSrc =  0x5902;
+                                if (idx >= 0x3c) palSrc += 0x40;
+                                if (idx >= 0x42) palSrc += 0x40;
+                                return {
+                                    name: `Small Rect BG 6-8: ${idx}`,
+                                    sources: [
+                                        ['screenCopy', 0xbd, 0x50e0, 0x9800],
+                                        ['screenCopy', 0xbd, 0x5248, 0x1800, 'rom', 'vram1'],
+                                        ['simpleCopy', bgBank, bgAddr, 0x8000, 0x500],
+                                        ['simpleCopy', objBank, objAddr, 0x9300, 0x500],
+                                        ['simpleCopy', 0xbd, palSrc, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                                    ],
+                                }
+                            }
+                        },
+                        {
+                            name: "Small Rect OBJ 6-8:",
+                            sources: [],
+                            isGBC: true,
+                            is8000: true,
+                            
+                            animated: true,
+                            animateStartIdx: 0x37,
+                            animateEndIdx: 0x48,
+                            animateFunc: function(idx, rom) {
+                                let offset = bankConv(9, 0x673d)+6*idx;
+                                let bgBank = 0x100+rom[offset];
+                                let bgAddr = rom[offset+1]+(rom[offset+2]<<8)
+                                let objBank = 0x100+rom[offset+3];
+                                let objAddr = rom[offset+4]+(rom[offset+5]<<8)
+                                let palSrc =  0x5902;
+                                if (idx >= 0x3c) palSrc += 0x40;
+                                if (idx >= 0x42) palSrc += 0x40;
+                                return {
+                                    name: `Small Rect OBJ 6-8: ${idx}`,
+                                    sources: [
+                                        ['simpleCopy', bgBank, bgAddr, 0x8000, 0x500],
+                                        ['simpleCopy', objBank, objAddr, 0x9300, 0x500],
+                                        ['simpleCopy', 0xbd, palSrc, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                                        ['spriteCopy', 0xbd, 0x5680, 0x0000, 0x20, 0x30],
+                                    ],
+                                }
+                            }
+                        },
+                        {
+                            name: "Anime Hi-col:",
+                            sources: [],
+                            is8000: true,
+                            isHighColor: true,
+                            rowsShown: 16,
+
+                            animated: true,
+                            animateStartIdx: 3,
+                            animateEndIdx: 0x28,
+                            animateFunc: function(idx, rom) {
+                                let offset = bankConv(9, 0x5f7a)+3*idx;
+                                let tileDataBank = 0x100+rom[offset];
+                                let tileDataAddr = rom[offset+1]+(rom[offset+2]<<8)
+
+                                offset = bankConv(9, 0x6352)+3*idx;
+                                let palettesBank = 0x100+rom[offset];
+                                let palettesAddr = rom[offset+1]+(rom[offset+2]<<8)
+                                
+                                return {
+                                    name: `Anime Hi-col: ${idx}`,
+                                    sources: [
+                                        ['screenCopy', 0xbd, 0x4000, 0x9800],
+                                        ['screenCopy', 0xbd, 0x4168, 0x1800, 'rom', 'vram1'],
+                                        ['simpleCopy', tileDataBank, tileDataAddr, 0x8000, 0x1400],
+                                        ['simpleCopy', palettesBank, palettesAddr, 0x0000, 0x2400, 'rom', 'hiColorPalettes'],
+                                    ],
+                                }
+                            }
+                        },
+                        {
+                            name: "Title Screen",
+                            sources: [
+                                ['simpleCopy', 0xa1, 0x4000, 0x8000, 0x1800],
+                                ['screenCopy', 0xa1, 0x5800, 0x9800],
+                                ['screenCopy', 0xa1, 0x5968, 0x1800, 'rom', 'vram1'],
+                                ['simpleCopy', 0xa1, 0x5ad0, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                        },
+                        {
+                            name: "Title Screen Color fixes",
+                            sources: [
+                                ['simpleCopy', 0xa1, 0x4000, 0x8000, 0x1800],
+                                ['spriteCopy', 0x93, 0x4a0a, 0x0000, 0x20, 0x30],
+                                ['simpleCopy', 0xa1, 0x5ad0, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                            is8000: true,
+                        },
+                        {
+                            name: "Title Screen Push Start",
+                            sources: [
+                                ['simpleCopy', 0xa1, 0x4000, 0x8000, 0x1800],
+                                ['spriteCopy', 0x93, 0x4a17, 0x0000, 0x20, 0x30],
+                                ['simpleCopy', 0xa1, 0x5ad0, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                            is8000: true,
+                        },
+                        {
+                            name: "Rankings Screen BG",
+                            sources: [
+                                ['simpleCopy', 0x9d, 0x4000, 0x8000, 0x1800],
+                                ['simpleCopy', 0xa3, 0x5800, 0x0000, 0x1800, 'rom', 'vram1'],
+                                
+                                ['screenCopy', 0x9d, 0x5800, 0x9800, 'rom', 'memory', 0x14, 0x10],
+                                ['screenCopy', 0x9d, 0x5940, 0x1800, 'rom', 'vram1', 0x14, 0x10],
+                                ['screenCopy', 0x9d, 0x5800, 0x9a00, 'rom', 'memory', 0x14, 0x10],
+                                ['screenCopy', 0x9d, 0x5940, 0x1a00, 'rom', 'vram1', 0x14, 0x10],
+                                
+                                ['simpleCopy', 0x9d, 0x5d00, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                            rowsShown: 32,
+                            canvasHeight: 32 * 8,
+                        },
+                        {
+                            name: "Rankings Screen Window",
+                            sources: [
+                                ['simpleCopy', 0x9d, 0x4000, 0x8000, 0x1800],
+                                ['simpleCopy', 0xa3, 0x5800, 0x0000, 0x1800, 'rom', 'vram1'],
+                                
+                                ['screenCopy', 0x9d, 0x5a80, 0x9840, 'rom', 'memory', 0x14, 0x10],
+                                ['screenCopy', 0x9d, 0x5bc0, 0x1840, 'rom', 'vram1', 0x14, 0x10],
+                                
+                                ['simpleCopy', 0x9d, 0x5d00, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                        },
+                        {
+                            name: "Rankings Metatiles",
+                            sources: [
+                                //['simpleCopy', 0x9d, 0x4000, 0x8000, 0x1800],
+                                ['simpleCopy', 0xa3, 0x5800, 0x0000, 0x1800, 'rom', 'vram1'],
+                                ['rankingsMetatiles', 0, 0, 0],
+                                ['simpleCopy', 0x9d, 0x5d00, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                            colsShown: 32,
+                            canvasWidth: 32 * 8,
+                        },
+                        {
+                            name: "Rankings sprites",
+                            sources: [
+                                ['simpleCopy', 0x9d, 0x4000, 0x8000, 0x1800],
+                                ['spriteCopy', 0x93, 0x4d79, 0x0000, 0x30, 0x10],
+                                ['spriteCopy', 0x93, 0x4d82, 0x0000, 0x30, 0x20],
+                                ['spriteCopy', 0x93, 0x4d8b, 0x0000, 0x30, 0x30],
+                                ['spriteCopy', 0x93, 0x4d67, 0x0000, 0x30, 0x40],
+                                ['spriteCopy', 0x93, 0x4d70, 0x0000, 0x30, 0x50],
+                                ['simpleCopy', 0x9d, 0x5d00, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                            is8000: true,
+                        },
+                        {
+                            name: "Title Screen Opts",
+                            sources: [
+                                ['simpleCopy', 0xa1, 0x5b10, 0x8000, 0x1800],
+                                ['screenCopy', 0xa1, 0x7310, 0x9800],
+                                ['screenCopy', 0xa1, 0x7478, 0x1800, 'rom', 'vram1'],
+                                ['simpleCopy', 0xa1, 0x75e0, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                        },
+                        {
+                            name: "Title Screen Opts sprites",
+                            sources: [
+                                ['simpleCopy', 0xa1, 0x5b10, 0x8000, 0x1800],
+                                ['spriteCopy', 0x93, 0x4a40, 0x0000, 0x50, 0x30],
+                                ['spriteCopy', 0x93, 0x4abd, 0x0000, 0x50, 0x30, true],
+                                ['spriteCopy', 0x93, 0x4a96, 0x0000, 0x50, 0x30],
+                                ['simpleCopy', 0xa1, 0x75e0, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                            is8000: true,
+                        },
+                        {
+                            name: "Game Setup BG:",
+                            sources: [],
+                            isGBC: true,
+
+                            animated: true,
+                            animateStartIdx: 0,
+                            animateEndIdx: 11,
+                            animateDelay: 10,
+                            animateFunc: function(idx, rom) {
+                                return {
+                                    name: `Game Setup BG: ${idx}`,
+                                    sources: [
+                                        ['simpleCopy', 0xcd, 0x5000, 0x0000, 0x1800, 'rom', 'vram1'],
+                                        ['simpleCopy', 0xcd, 0x4000, 0x8800, 0x1000],
+                                        ['screenCopy', 0xcd, 0x7340, 0x9800, 'rom', 'memory', 0x14, 7],
+                                        ['screenCopy', 0xcd, 0x73cc, 0x1800, 'rom', 'vram1', 0x14, 7],
+                                        
+                                        ['simpleCopy', 0xcd, 0x6800+0x80*(idx%4), 0x98e0, 0x40],
+                                        ['simpleCopy', 0xcd, 0x6840+0x80*(idx%4), 0x18e0, 0x40, 'rom', 'vram1'],
+                                        ['simpleCopy', 0xcd, 0x6a00+0x80*(idx%6), 0x9920, 0x40],
+                                        ['simpleCopy', 0xcd, 0x6a40+0x80*(idx%6), 0x1920, 0x40, 'rom', 'vram1'],
+                                        ['simpleCopy', 0xcd, 0x6d00+0x80*(idx%4), 0x9960, 0x40],
+                                        ['simpleCopy', 0xcd, 0x6d40+0x80*(idx%4), 0x1960, 0x40, 'rom', 'vram1'],
+                                        ['simpleCopy', 0xcd, 0x6f00+0x80*(idx%6), 0x99a0, 0x40],
+                                        ['simpleCopy', 0xcd, 0x6f40+0x80*(idx%6), 0x19a0, 0x40, 'rom', 'vram1'],
+                                        ['simpleCopy', 0xcd, 0x7200+0x80*(idx%2), 0x99e0, 0x40],
+                                        ['simpleCopy', 0xcd, 0x7240+0x80*(idx%2), 0x19e0, 0x40, 'rom', 'vram1'],
+                                        
+                                        ['simpleCopy', 0xcd, 0x7300, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                                    ]
+                                }
+                            }
+                        },
+                        {
+                            name: "Game Setup Window:",
+                            sources: [],
+                            isGBC: true,
+
+                            animated: true,
+                            animateStartIdx: 0,
+                            animateEndIdx: 1,
+                            animateDelay: 10,
+                            animateFunc: function(idx, rom) {
+                                return {
+                                    name: `Game Setup Window: ${idx}`,
+                                    sources: [
+                                        ['simpleCopy', 0xcd, 0x5000, 0x0000, 0x1800, 'rom', 'vram1'],
+                                        ['simpleCopy', 0xcd, 0x4000, 0x8800, 0x1000],
+                                        ['screenCopy', 0xcd, 0x7458, 0x9800, 'rom', 'memory', 0x14, 9],
+                                        ['screenCopy', 0xcd, 0x750c, 0x1800, 'rom', 'vram1', 0x14, 9],
+                                        
+                                        ['screenCopy', 0xcd, 0x75c0+idx*0xa0, 0x9900, 'rom', 'memory', 0x14, 2],
+                                        ['screenCopy', 0xcd, 0x7610+idx*0xa0, 0x1900, 'rom', 'vram1', 0x14, 2],
+                                        
+                                        ['simpleCopy', 0xcd, 0x7300, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                                    ]
+                                }
+                            }
+                        },
+                        {
+                            name: "Game Setup Scrolling text",
+                            sources: [
+                                ['simpleCopy', 0xcd, 0x5000, 0x0000, 0x1800, 'rom', 'vram1'],
+                                ['simpleCopy', 0xcd, 0x4000, 0x8800, 0x1000],
+
+                                ['scrollCopy', 0x0a, 0x5d55, 0x9800, 0x2d-0x12],
+                                ['scrollCopy', 0x0a, 0x5dc1, 0x9840, 0x2e-0x12],
+                                ['scrollCopy', 0x0a, 0x5e31, 0x9880, 0x2a-0x12],
+                                ['scrollCopy', 0x0a, 0x5e91, 0x98c0, 0x2a-0x12],
+                                ['scrollCopy', 0x0a, 0x5ef1, 0x9900, 0x2d-0x12],
+                                
+                                ['simpleCopy', 0xcd, 0x7300, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                            colsShown: 32,
+                            canvasWidth: 32 * 8,
+                        },
+                        {
+                            name: "Picture Book Main",
+                            sources: [
+                                ['simpleCopy', 0xc7, 0x5f40, 0x0000, 0x1800, 'rom', 'vram1'],
+                                ['simpleCopy', 0xc7, 0x4a40, 0x8000, 0x1800],
+
+                                ['simpleCopy', 0xc7, 0x4b40, 0x8000, 0x400],
+                                ['simpleCopy', 0xc7, 0x4f40, 0x9500, 0x300],
+
+                                ['screenCopy', 0xc8, 0x5800, 0x9800],
+                                ['screenCopy', 0xc8, 0x5968, 0x1800, 'rom', 'vram1'],
+                                ['simpleCopy', 0xcd, 0x7300, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                        },
+                        {
+                            name: "Picture Book Scrolling text",
+                            sources: [
+                                ['simpleCopy', 0xc7, 0x5f40, 0x0000, 0x1800, 'rom', 'vram1'],
+                                ['simpleCopy', 0xc7, 0x4a40, 0x8000, 0x1800],
+                                
+                                ['scrollCopy', 0x0a, 0x54ed, 0x9800, 0x2c-0x12],
+                                ['scrollCopy', 0x0a, 0x5555, 0x9840, 0x2a-0x12],
+                                ['scrollCopy', 0x0a, 0x55b5, 0x9880, 0x29-0x12],
+                                ['scrollCopy', 0x0a, 0x5611, 0x98c0, 0x1c-0x12],
+                                ['scrollCopy', 0x0a, 0x5639, 0x9900, 0x1c-0x12],
+                                ['scrollCopy', 0x0a, 0x5661, 0x9940, 0x1c-0x12],
+                                
+                                ['simpleCopy', 0xcd, 0x7300, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                            colsShown: 32,
+                            canvasWidth: 32 * 8,
+                        },
+                        {
+                            name: "Picture Book Train List 1",
+                            sources: [
+                                ['simpleCopy', 0xc7, 0x5f40, 0x0000, 0x1800, 'rom', 'vram1'],
+                                ['simpleCopy', 0xc7, 0x4a40, 0x8000, 0x1800],
+
+                                ['simpleCopy', 0xc7, 0x4b40, 0x8000, 0x400],
+                                ['simpleCopy', 0xc7, 0x4f40, 0x9500, 0x300],
+                                ['simpleCopy', 0xc9, 0x4000, 0x8800, 0x300],
+
+                                ...[...Array(25).keys()].map(i => ['simpleCopy', 0xc9, 0x6b00+i*0x20, 0x9800+i*0x20, 16]),
+                                ...[...Array(25).keys()].map(i => ['simpleCopy', 0xc9, 0x7800, 0x1800+i*0x20, 16, 'rom', 'vram1']),
+
+                                ['simpleCopy', 0xcd, 0x7300, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                            rowsShown: 25,
+                            canvasHeight: 25 * 8,
+                        },
+                        {
+                            name: "Picture Book Train List 2",
+                            sources: [
+                                ['simpleCopy', 0xc7, 0x5f40, 0x0000, 0x1800, 'rom', 'vram1'],
+                                ['simpleCopy', 0xc7, 0x4a40, 0x8000, 0x1800],
+
+                                ['simpleCopy', 0xc7, 0x4b40, 0x8000, 0x400],
+                                ['simpleCopy', 0xc7, 0x4f40, 0x9500, 0x300],
+                                ['simpleCopy', 0xc9, 0x4000, 0x8800, 0x300],
+
+                                ...[...Array(25).keys()].map(i => ['simpleCopy', 0xc9, 0x6b00+(i+25)*0x20, 0x9800+i*0x20, 16]),
+                                ...[...Array(25).keys()].map(i => ['simpleCopy', 0xc9, 0x7800, 0x1800+i*0x20, 16, 'rom', 'vram1']),
+
+                                ['simpleCopy', 0xcd, 0x7300, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                            rowsShown: 25,
+                            canvasHeight: 25 * 8,
+                        },
+                        {
+                            name: "Picture Book Train List 3",
+                            sources: [
+                                ['simpleCopy', 0xc7, 0x5f40, 0x0000, 0x1800, 'rom', 'vram1'],
+                                ['simpleCopy', 0xc7, 0x4a40, 0x8000, 0x1800],
+
+                                ['simpleCopy', 0xc7, 0x4b40, 0x8000, 0x400],
+                                ['simpleCopy', 0xc7, 0x4f40, 0x9500, 0x300],
+                                ['simpleCopy', 0xc9, 0x4000, 0x8800, 0x300],
+
+                                ...[...Array(25).keys()].map(i => ['simpleCopy', 0xc9, 0x6b00+(i+50)*0x20, 0x9800+i*0x20, 16]),
+                                ...[...Array(25).keys()].map(i => ['simpleCopy', 0xc9, 0x7800, 0x1800+i*0x20, 16, 'rom', 'vram1']),
+
+                                ['simpleCopy', 0xcd, 0x7300, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                            rowsShown: 25,
+                            canvasHeight: 25 * 8,
+                        },
+                        {
+                            name: "Picture Book Train List 4",
+                            sources: [
+                                ['simpleCopy', 0xc7, 0x5f40, 0x0000, 0x1800, 'rom', 'vram1'],
+                                ['simpleCopy', 0xc7, 0x4a40, 0x8000, 0x1800],
+
+                                ['simpleCopy', 0xc7, 0x4b40, 0x8000, 0x400],
+                                ['simpleCopy', 0xc7, 0x4f40, 0x9500, 0x300],
+                                ['simpleCopy', 0xc9, 0x4000, 0x8800, 0x300],
+
+                                ...[...Array(25).keys()].map(i => ['simpleCopy', 0xc9, 0x6b00+(i+75)*0x20, 0x9800+i*0x20, 16]),
+                                ...[...Array(25).keys()].map(i => ['simpleCopy', 0xc9, 0x7800, 0x1800+i*0x20, 16, 'rom', 'vram1']),
+
+                                ['simpleCopy', 0xcd, 0x7300, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                            rowsShown: 25,
+                            canvasHeight: 25 * 8,
+                        },
+                        {
+                            name: "Print train text 1",
+                            sources: [
+                                ['simpleCopy', 0xac, 0x4000, 0x8000, 0x1800],
+                                ['screenCopy', 0xac, 0x5800, 0x9800],
+                                ['screenCopy', 0xac, 0x5968, 0x1800, 'rom', 'vram1'],
+                                
+                                ['screenCopy', 0xac, 0x5ad0, 0x9842, 'rom', 'memory', 0x10, 6],
+                                ['screenCopy', 0xac, 0x5ad0+0x60, 0x1842, 'rom', 'vram1', 0x10, 6],
+
+                                ['simpleCopy', 0xac, 0x6010, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                        },
+                        {
+                            name: "Print train text 2",
+                            sources: [
+                                ['simpleCopy', 0xac, 0x4000, 0x8000, 0x1800],
+                                ['screenCopy', 0xac, 0x5800, 0x9800],
+                                ['screenCopy', 0xac, 0x5968, 0x1800, 'rom', 'vram1'],
+                                
+                                ['screenCopy', 0xac, 0x5b90, 0x9842, 'rom', 'memory', 0x10, 6],
+                                ['screenCopy', 0xac, 0x5b90+0x60, 0x1842, 'rom', 'vram1', 0x10, 6],
+
+                                ['simpleCopy', 0xac, 0x6010, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                        },
+                        {
+                            name: "Print train text 3",
+                            sources: [
+                                ['simpleCopy', 0xac, 0x4000, 0x8000, 0x1800],
+                                ['screenCopy', 0xac, 0x5800, 0x9800],
+                                ['screenCopy', 0xac, 0x5968, 0x1800, 'rom', 'vram1'],
+                                
+                                ['screenCopy', 0xac, 0x5c50, 0x9842, 'rom', 'memory', 0x10, 6],
+                                ['screenCopy', 0xac, 0x5c50+0x60, 0x1842, 'rom', 'vram1', 0x10, 6],
+
+                                ['simpleCopy', 0xac, 0x6010, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                        },
+                        {
+                            name: "Print train text 4",
+                            sources: [
+                                ['simpleCopy', 0xac, 0x4000, 0x8000, 0x1800],
+                                ['screenCopy', 0xac, 0x5800, 0x9800],
+                                ['screenCopy', 0xac, 0x5968, 0x1800, 'rom', 'vram1'],
+                                
+                                ['screenCopy', 0xac, 0x5d10, 0x9842, 'rom', 'memory', 0x10, 6],
+                                ['screenCopy', 0xac, 0x5d10+0x60, 0x1842, 'rom', 'vram1', 0x10, 6],
+
+                                ['simpleCopy', 0xac, 0x6010, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                        },
+                        {
+                            name: "Print train text 5",
+                            sources: [
+                                ['simpleCopy', 0xac, 0x4000, 0x8000, 0x1800],
+                                ['screenCopy', 0xac, 0x5800, 0x9800],
+                                ['screenCopy', 0xac, 0x5968, 0x1800, 'rom', 'vram1'],
+                                
+                                ['screenCopy', 0xac, 0x5dd0, 0x9842, 'rom', 'memory', 0x10, 6],
+                                ['screenCopy', 0xac, 0x5dd0+0x60, 0x1842, 'rom', 'vram1', 0x10, 6],
+
+                                ['simpleCopy', 0xac, 0x6010, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                        },
+                        {
+                            name: "Print train text 6",
+                            sources: [
+                                ['simpleCopy', 0xac, 0x4000, 0x8000, 0x1800],
+                                ['screenCopy', 0xac, 0x5800, 0x9800],
+                                ['screenCopy', 0xac, 0x5968, 0x1800, 'rom', 'vram1'],
+                                
+                                ['screenCopy', 0xac, 0x5e90, 0x9842, 'rom', 'memory', 0x10, 6],
+                                ['screenCopy', 0xac, 0x5e90+0x60, 0x1842, 'rom', 'vram1', 0x10, 6],
+
+                                ['simpleCopy', 0xac, 0x6010, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                        },
+                        {
+                            name: "Print train text 7",
+                            sources: [
+                                ['simpleCopy', 0xac, 0x4000, 0x8000, 0x1800],
+                                ['screenCopy', 0xac, 0x5800, 0x9800],
+                                ['screenCopy', 0xac, 0x5968, 0x1800, 'rom', 'vram1'],
+                                
+                                ['screenCopy', 0xac, 0x5f50, 0x9842, 'rom', 'memory', 0x10, 6],
+                                ['screenCopy', 0xac, 0x5f50+0x60, 0x1842, 'rom', 'vram1', 0x10, 6],
+
+                                ['simpleCopy', 0xac, 0x6010, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                        },
+                        {
+                            name: "Trainline Selection",
+                            sources: [
+                                ['simpleCopy', 0xca, 0x4000, 0x9200, 0x200],
+                                ['simpleCopy', 0xca, 0x4200, 0x0000, 0x1800, 'rom', 'vram1'],
+                                ['screenCopy', 0xca, 0x6780, 0x9800, 'rom', 'memory', 0x15, 0xd],
+                                ['screenCopy', 0xca, 0x6891, 0x1800, 'rom', 'vram1', 0x15, 0x12],
+                                ['simpleCopy', 0xca, 0x6280, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                        },
+                        {
+                            name: "Pre in-game",
+                            sources: [
+                                ['screenCopy', 0xa2, 0x7310, 0x9800, 'rom', 'memory', 0x14, 0x13],
+                                ['screenCopy', 0xa2, 0x748c, 0x1800, 'rom', 'vram1', 0x14, 0x13],
+                                ['simpleCopy', 0x87, 0x5400, 0x8800, 0x1000],
+                                ['simpleCopy', 0x87, 0x6400, 0x800, 0x400, 'rom', 'vram1'],
+                                ['simpleCopy', 0x50, 0x4000-0x40, 0x0000, 0x2400, 'rom', 'hiColorPalettes'],
+                                //['simpleCopy', 0xb4, 0x4000-0x40, 0x0000, 0x2400, 'rom', 'hiColorPalettes'],
+                                //['simpleCopy', 0xb4, 0x5000-0x40, 0x0000, 0x2400, 'rom', 'hiColorPalettes'],
+                                //['simpleCopy', 0xb4, 0x6000-0x40, 0x0000, 0x2400, 'rom', 'hiColorPalettes'],
+                            ],
+                            isHighColor: true,
+                            rowsShown: 16,
+                        },
+                        {
+                            name: "Route display 1",
+                            sources: [
+                                ['screenCopy', 0xb0, 0x4000, 0x9800, 'rom', 'memory', 0x14, 0x5],
+                                ['screenCopy', 0xb0, 0x4064, 0x1800, 'rom', 'vram1', 0x14, 0x5],
+                                ['screenCopy', 0xb0, 0x4898, 0x98a0, 'rom', 'memory', 0x20, 0xd],
+                                ['screenCopy', 0xb0, 0x4a38, 0x18a0, 'rom', 'vram1', 0x20, 0xd],
+                                ['simpleCopy', 0xad, 0x4f00, 0x8000, 0x1800],
+                                ['simpleCopy', 0xb0, 0x6e60, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                        },
+                        {
+                            name: "Route display 2",
+                            sources: [
+                                ['screenCopy', 0xb0, 0x40c8, 0x9800, 'rom', 'memory', 0x14, 0x5],
+                                ['screenCopy', 0xb0, 0x40c8+0x64, 0x1800, 'rom', 'vram1', 0x14, 0x5],
+                                ['screenCopy', 0xb0, 0x4bd8, 0x98a0, 'rom', 'memory', 0x20, 0xd],
+                                ['screenCopy', 0xb0, 0x4bd8+0x1a0, 0x18a0, 'rom', 'vram1', 0x20, 0xd],
+                                ['simpleCopy', 0xad, 0x6700, 0x8000, 0x1800],
+                                ['simpleCopy', 0xb0, 0x6e60, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                        },
+                        {
+                            name: "Continue Screen 1",
+                            sources: [
+                                ['simpleCopy', 0x9f, 0x4000, 0x8000, 0x1800],
+                                ['simpleCopy', 0x9f, 0x5800, 0x0000, 0x1800, 'rom', 'vram1'],
+                                
+                                ['screenCopy', 0x9e, 0x7cc0, 0x9800],
+                                ['screenCopy', 0x9e, 0x7e28, 0x1800, 'rom', 'vram1'],
+
+                                ['simpleCopy', 0x9f, 0x7a80+0*0x100, 0x9860, 0x80],
+                                ['simpleCopy', 0x9f, 0x7a80+0*0x100+0x80, 0x1860, 0x80, 'rom', 'vram1'],
+
+                                ['simpleCopy', 0x9f, 0x7000+0*0x180, 0x9960, 0xc0],
+                                ['simpleCopy', 0x9f, 0x7000+0*0x180+0xc0, 0x1960, 0xc0, 'rom', 'vram1'],
+
+                                ['simpleCopy', 0x9f, 0x7d80, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                        },
+                        {
+                            name: "Continue Screen 2",
+                            sources: [
+                                ['simpleCopy', 0x9f, 0x4000, 0x8000, 0x1800],
+                                ['simpleCopy', 0x9f, 0x5800, 0x0000, 0x1800, 'rom', 'vram1'],
+                                
+                                ['screenCopy', 0x9e, 0x7cc0, 0x9800],
+                                ['screenCopy', 0x9e, 0x7e28, 0x1800, 'rom', 'vram1'],
+
+                                ['simpleCopy', 0x9f, 0x7a80+1*0x100, 0x9860, 0x80],
+                                ['simpleCopy', 0x9f, 0x7a80+1*0x100+0x80, 0x1860, 0x80, 'rom', 'vram1'],
+
+                                ['simpleCopy', 0x9f, 0x7000+1*0x180, 0x9960, 0xc0],
+                                ['simpleCopy', 0x9f, 0x7000+1*0x180+0xc0, 0x1960, 0xc0, 'rom', 'vram1'],
+
+                                ['simpleCopy', 0x9f, 0x7d80, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                        },
+                        {
+                            name: "Continue Screen 3",
+                            sources: [
+                                ['simpleCopy', 0x9f, 0x4000, 0x8000, 0x1800],
+                                ['simpleCopy', 0x9f, 0x5800, 0x0000, 0x1800, 'rom', 'vram1'],
+                                
+                                ['screenCopy', 0x9e, 0x7cc0, 0x9800],
+                                ['screenCopy', 0x9e, 0x7e28, 0x1800, 'rom', 'vram1'],
+
+                                ['simpleCopy', 0x9f, 0x7a80+2*0x100, 0x9860, 0x80],
+                                ['simpleCopy', 0x9f, 0x7a80+2*0x100+0x80, 0x1860, 0x80, 'rom', 'vram1'],
+
+                                ['simpleCopy', 0x9f, 0x7000+2*0x180, 0x9960, 0xc0],
+                                ['simpleCopy', 0x9f, 0x7000+2*0x180+0xc0, 0x1960, 0xc0, 'rom', 'vram1'],
+
+                                ['simpleCopy', 0x9f, 0x7d80, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                        },
+                        {
+                            name: "Continue Screen 4",
+                            sources: [
+                                ['simpleCopy', 0x9f, 0x4000, 0x8000, 0x1800],
+                                ['simpleCopy', 0x9f, 0x5800, 0x0000, 0x1800, 'rom', 'vram1'],
+                                
+                                ['screenCopy', 0x9e, 0x7cc0, 0x9800],
+                                ['screenCopy', 0x9e, 0x7e28, 0x1800, 'rom', 'vram1'],
+
+                                ['simpleCopy', 0x9f, 0x7000+3*0x180, 0x9960, 0xc0],
+                                ['simpleCopy', 0x9f, 0x7000+3*0x180+0xc0, 0x1960, 0xc0, 'rom', 'vram1'],
+
+                                ['simpleCopy', 0x9f, 0x7d80, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                        },
+                        {
+                            name: "Continue Screen 5",
+                            sources: [
+                                ['simpleCopy', 0x9f, 0x4000, 0x8000, 0x1800],
+                                ['simpleCopy', 0x9f, 0x5800, 0x0000, 0x1800, 'rom', 'vram1'],
+                                
+                                ['screenCopy', 0x9e, 0x7cc0, 0x9800],
+                                ['screenCopy', 0x9e, 0x7e28, 0x1800, 'rom', 'vram1'],
+
+                                ['simpleCopy', 0x9f, 0x7000+4*0x180, 0x9960, 0xc0],
+                                ['simpleCopy', 0x9f, 0x7000+4*0x180+0xc0, 0x1960, 0xc0, 'rom', 'vram1'],
+
+                                ['simpleCopy', 0x9f, 0x7d80, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                        },
+                        {
+                            name: "Continue Screen 6",
+                            sources: [
+                                ['simpleCopy', 0x9f, 0x4000, 0x8000, 0x1800],
+                                ['simpleCopy', 0x9f, 0x5800, 0x0000, 0x1800, 'rom', 'vram1'],
+                                
+                                ['screenCopy', 0x9e, 0x7cc0, 0x9800],
+                                ['screenCopy', 0x9e, 0x7e28, 0x1800, 'rom', 'vram1'],
+
+                                ['simpleCopy', 0x9f, 0x7000+5*0x180, 0x9960, 0xc0],
+                                ['simpleCopy', 0x9f, 0x7000+5*0x180+0xc0, 0x1960, 0xc0, 'rom', 'vram1'],
+
+                                ['simpleCopy', 0x9f, 0x7d80, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                        },
+                        {
+                            name: "Continue Screen 7",
+                            sources: [
+                                ['simpleCopy', 0x9f, 0x4000, 0x8000, 0x1800],
+                                ['simpleCopy', 0x9f, 0x5800, 0x0000, 0x1800, 'rom', 'vram1'],
+                                
+                                ['screenCopy', 0x9e, 0x7cc0, 0x9800],
+                                ['screenCopy', 0x9e, 0x7e28, 0x1800, 'rom', 'vram1'],
+
+                                ['simpleCopy', 0x9f, 0x7000+6*0x180, 0x9960, 0xc0],
+                                ['simpleCopy', 0x9f, 0x7000+6*0x180+0xc0, 0x1960, 0xc0, 'rom', 'vram1'],
+
+                                ['simpleCopy', 0x9f, 0x7d80, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                        },
+                        {
+                            name: "Scoring",
+                            sources: [
+                                ['simpleCopy', 0xa2, 0x4000, 0x8000, 0x1800],
+                                
+                                ['screenCopy', 0xa2, 0x5800, 0x9800],
+                                ['screenCopy', 0xa2, 0x5968, 0x1800, 'rom', 'vram1'],
+
+                                ['simpleCopy', 0xa2, 0x5ad0, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                        },
+                        {
+                            name: "Photo Get",
+                            sources: [
+                                ['simpleCopy', 0xc7, 0x3300, 0x8000, 0x1800],
+                                
+                                ['screenCopy', 0xc7, 0x7890, 0x9800],
+                                ['screenCopy', 0xc7, 0x79f8, 0x1800, 'rom', 'vram1'],
+
+                                ['simpleCopy', 0xc7, 0x4b00, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                        },
+                        {
+                            name: "Game Over",
+                            sources: [
+                                ['simpleCopy', 0x9f, 0x4000, 0x8000, 0x1800],
+                                ['simpleCopy', 0x9f, 0x5800, 0x0000, 0x1800, 'rom', 'vram1'],
+                                
+                                ['screenCopy', 0x9d, 0x6b40, 0x9800],
+                                ['screenCopy', 0x9d, 0x6ca8, 0x1800, 'rom', 'vram1'],
+
+                                ['simpleCopy', 0x9f, 0x7d80, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                        },
+                        {
+                            name: "Location done",
+                            sources: [
+                                ['simpleCopy', 0x9e, 0x4000, 0x8000, 0x700],
+                                ['simpleCopy', 0x9e, 0x4700, 0x8700, 0x700],
+                                
+                                ['simpleCopy', 0x9e, 0x4e00, 0x8e00, 0x500],
+                                ['simpleCopy', 0x9e, 0x5300, 0x9300, 0x500],
+                                //['simpleCopy', 0x9d, 0x6440, 0x8700, 0x700],
+                                
+                                ['screenCopy', 0x9e, 0x7600, 0x9800, 'rom', 'memory', 0x20],
+                                ['screenCopy', 0x9e, 0x7840, 0x1800, 'rom', 'vram1', 0x20],
+
+                                ['simpleCopy', 0x9e, 0x7a80, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                        },
+                        {
+                            name: "Location done 2",
+                            sources: [
+                                ['simpleCopy', 0x9e, 0x4000, 0x8000, 0x700],
+                                ['simpleCopy', 0x9d, 0x6440, 0x8700, 0x700],
+                                
+                                ['simpleCopy', 0x9e, 0x4e00, 0x8e00, 0x500],
+                                ['simpleCopy', 0x9e, 0x5300, 0x9300, 0x500],
+                                //['simpleCopy', 0x9d, 0x6440, 0x8700, 0x700],
+                                
+                                ['screenCopy', 0x9e, 0x7600, 0x9800, 'rom', 'memory', 0x20],
+                                ['screenCopy', 0x9e, 0x7840, 0x1800, 'rom', 'vram1', 0x20],
+
+                                ['simpleCopy', 0x9e, 0x7a80, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                        },
+                        {
+                            name: "Enter high score",
+                            sources: [
+                                ['simpleCopy', 0xa3, 0x4000, 0x8000, 0x1800],
+                                ['simpleCopy', 0xa3, 0x5800, 0x0000, 0x1800, 'rom', 'vram1'],
+                                
+                                ['screenCopy', 0xa3, 0x7000, 0x9800],
+                                ['screenCopy', 0xa3, 0x7168, 0x1800, 'rom', 'vram1'],
+
+                                ['screenCopy', 0xa3, 0x72d0, 0x99a0, 'rom', 'memory', 0x20, 2],
+                                ['screenCopy', 0xa3, 0x7310, 0x19a0, 'rom', 'vram1', 0x20, 2],
+
+                                ['simpleCopy', 0xa3, 0x7350, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                            colsShown: 32,
+                            canvasWidth: 32 * 8,
+                        },
+                        {
+                            name: "Events 1",
+                            sources: [
+                                ['simpleCopy', 0xb1, 0x7200, 0x8800, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9800, 0x80, 0],
+                                ['simpleCopy', 0x9c, 0x7200+0*8, 0x0000, 0x8, 'rom', 'bgPalettes'],
+
+                                ['simpleCopy', 0xb1, 0x4000, 0x8a00, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9807, 0xa0, 1],
+                                ['simpleCopy', 0x9c, 0x7200+0*8, 0x0008, 0x8, 'rom', 'bgPalettes'],
+
+                                ['simpleCopy', 0xb1, 0x4200, 0x8c00, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9880, 0xc0, 2],
+                                ['simpleCopy', 0x9c, 0x7200+1*8, 0x0010, 0x8, 'rom', 'bgPalettes'],
+
+                                ['simpleCopy', 0xb1, 0x4400, 0x8e00, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9887, 0xe0, 3],
+                                ['simpleCopy', 0x9c, 0x7200+2*8, 0x0018, 0x8, 'rom', 'bgPalettes'],
+
+                                ['simpleCopy', 0xb1, 0x4600, 0x9000, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9900, 0x00, 4],
+                                ['simpleCopy', 0x9c, 0x7200+3*8, 0x0020, 0x8, 'rom', 'bgPalettes'],
+
+                                ['simpleCopy', 0xb1, 0x4800, 0x9200, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9907, 0x20, 5],
+                                ['simpleCopy', 0x9c, 0x7200+3*8, 0x0028, 0x8, 'rom', 'bgPalettes'],
+
+                                ['simpleCopy', 0xb1, 0x4a00, 0x9400, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9980, 0x40, 6],
+                                ['simpleCopy', 0x9c, 0x7200+4*8, 0x0030, 0x8, 'rom', 'bgPalettes'],
+
+                                ['simpleCopy', 0xb1, 0x4c00, 0x9600, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9987, 0x60, 7],
+                                ['simpleCopy', 0x9c, 0x7200+1*8, 0x0038, 0x8, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                            colsShown: 14,
+                            canvasWidth: 14 * 8,
+                            rowsShown: 16,
+                            canvasHeight: 16 * 8,
+                        },
+                        {
+                            name: "Events 2",
+                            sources: [
+                                ['simpleCopy', 0xb1, 0x4e00, 0x8800, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9800, 0x80, 0],
+                                ['simpleCopy', 0x9c, 0x7200+3*8, 0x0000, 0x8, 'rom', 'bgPalettes'],
+
+                                ['simpleCopy', 0xb1, 0x5000, 0x8a00, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9807, 0xa0, 1],
+                                ['simpleCopy', 0x9c, 0x7200+4*8, 0x0008, 0x8, 'rom', 'bgPalettes'],
+
+                                ['simpleCopy', 0xb1, 0x5200, 0x8c00, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9880, 0xc0, 2],
+                                ['simpleCopy', 0x9c, 0x7200+3*8, 0x0010, 0x8, 'rom', 'bgPalettes'],
+
+                                ['simpleCopy', 0xb1, 0x5400, 0x8e00, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9887, 0xe0, 3],
+                                ['simpleCopy', 0x9c, 0x7200+3*8, 0x0018, 0x8, 'rom', 'bgPalettes'],
+
+                                ['simpleCopy', 0xb1, 0x5600, 0x9000, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9900, 0x00, 4],
+                                ['simpleCopy', 0x9c, 0x7200+3*8, 0x0020, 0x8, 'rom', 'bgPalettes'],
+
+                                ['simpleCopy', 0xb1, 0x5800, 0x9200, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9907, 0x20, 5],
+                                ['simpleCopy', 0x9c, 0x7200+3*8, 0x0028, 0x8, 'rom', 'bgPalettes'],
+
+                                ['simpleCopy', 0xb1, 0x5a00, 0x9400, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9980, 0x40, 6],
+                                ['simpleCopy', 0x9c, 0x7200+3*8, 0x0030, 0x8, 'rom', 'bgPalettes'],
+
+                                ['simpleCopy', 0xb1, 0x5c00, 0x9600, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9987, 0x60, 7],
+                                ['simpleCopy', 0x9c, 0x7200+3*8, 0x0038, 0x8, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                            colsShown: 14,
+                            canvasWidth: 14 * 8,
+                            rowsShown: 16,
+                            canvasHeight: 16 * 8,
+                        },
+                        {
+                            name: "Events 3",
+                            sources: [
+                                ['simpleCopy', 0xb1, 0x5e00, 0x8800, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9800, 0x80, 0],
+                                ['simpleCopy', 0x9c, 0x7200+3*8, 0x0000, 0x8, 'rom', 'bgPalettes'],
+
+                                ['simpleCopy', 0xb1, 0x6000, 0x8a00, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9807, 0xa0, 1],
+                                ['simpleCopy', 0x9c, 0x7200+2*8, 0x0008, 0x8, 'rom', 'bgPalettes'],
+
+                                ['simpleCopy', 0xb1, 0x6200, 0x8c00, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9880, 0xc0, 2],
+                                ['simpleCopy', 0x9c, 0x7200+2*8, 0x0010, 0x8, 'rom', 'bgPalettes'],
+
+                                ['simpleCopy', 0xb1, 0x6400, 0x8e00, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9887, 0xe0, 3],
+                                ['simpleCopy', 0x9c, 0x7200+3*8, 0x0018, 0x8, 'rom', 'bgPalettes'],
+
+                                ['simpleCopy', 0xb1, 0x6600, 0x9000, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9900, 0x00, 4],
+                                ['simpleCopy', 0x9c, 0x7200+5*8, 0x0020, 0x8, 'rom', 'bgPalettes'],
+
+                                ['simpleCopy', 0xb1, 0x6800, 0x9200, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9907, 0x20, 5],
+                                ['simpleCopy', 0x9c, 0x7200+6*8, 0x0028, 0x8, 'rom', 'bgPalettes'],
+
+                                ['simpleCopy', 0xb1, 0x6a00, 0x9400, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9980, 0x40, 6],
+                                ['simpleCopy', 0x9c, 0x7200+7*8, 0x0030, 0x8, 'rom', 'bgPalettes'],
+
+                                ['simpleCopy', 0xb1, 0x6c00, 0x9600, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9987, 0x60, 7],
+                                ['simpleCopy', 0x9c, 0x7200+8*8, 0x0038, 0x8, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                            colsShown: 14,
+                            canvasWidth: 14 * 8,
+                            rowsShown: 16,
+                            canvasHeight: 16 * 8,
+                        },
+                        {
+                            name: "Events 4",
+                            sources: [
+                                ['simpleCopy', 0xb1, 0x6e00, 0x8800, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9800, 0x80, 0],
+                                ['simpleCopy', 0x9c, 0x7200+9*8, 0x0000, 0x8, 'rom', 'bgPalettes'],
+
+                                ['simpleCopy', 0xb1, 0x7000, 0x8a00, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9807, 0xa0, 1],
+                                ['simpleCopy', 0x9c, 0x7200+9*8, 0x0008, 0x8, 'rom', 'bgPalettes'],
+
+                                ['simpleCopy', 0xb1, 0x7400, 0x8c00, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9880, 0xc0, 2],
+                                ['simpleCopy', 0x9c, 0x7200+8*8, 0x0010, 0x8, 'rom', 'bgPalettes'],
+
+                                ['simpleCopy', 0xb1, 0x7600, 0x8e00, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9887, 0xe0, 3],
+                                ['simpleCopy', 0x9c, 0x7200+10*8, 0x0018, 0x8, 'rom', 'bgPalettes'],
+
+                                ['simpleCopy', 0xb1, 0x7800, 0x9000, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9900, 0x00, 4],
+                                ['simpleCopy', 0x9c, 0x7200+2*8, 0x0020, 0x8, 'rom', 'bgPalettes'],
+
+                                ['simpleCopy', 0xb1, 0x7a00, 0x9200, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9907, 0x20, 5],
+                                ['simpleCopy', 0x9c, 0x7200+3*8, 0x0028, 0x8, 'rom', 'bgPalettes'],
+
+                                ['simpleCopy', 0xb1, 0x7c00, 0x9400, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9980, 0x40, 6],
+                                ['simpleCopy', 0x9c, 0x7200+3*8, 0x0030, 0x8, 'rom', 'bgPalettes'],
+
+                                ['simpleCopy', 0xb1, 0x7e00, 0x9600, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9987, 0x60, 7],
+                                ['simpleCopy', 0x9c, 0x7200+3*8, 0x0038, 0x8, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                            colsShown: 14,
+                            canvasWidth: 14 * 8,
+                            rowsShown: 16,
+                            canvasHeight: 16 * 8,
+                        },
+                        {
+                            name: "Events 5",
+                            sources: [
+                                ['simpleCopy', 0xb2, 0x4000, 0x8800, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9800, 0x80, 0],
+                                ['simpleCopy', 0x9c, 0x7200+3*8, 0x0000, 0x8, 'rom', 'bgPalettes'],
+
+                                ['simpleCopy', 0xb2, 0x4200, 0x8a00, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9807, 0xa0, 1],
+                                ['simpleCopy', 0x9c, 0x7200+3*8, 0x0008, 0x8, 'rom', 'bgPalettes'],
+
+                                ['simpleCopy', 0xb2, 0x4400, 0x8c00, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9880, 0xc0, 2],
+                                ['simpleCopy', 0x9c, 0x7200+3*8, 0x0010, 0x8, 'rom', 'bgPalettes'],
+
+                                ['simpleCopy', 0xb2, 0x4600, 0x8e00, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9887, 0xe0, 3],
+                                ['simpleCopy', 0x9c, 0x7200+3*8, 0x0018, 0x8, 'rom', 'bgPalettes'],
+
+                                ['simpleCopy', 0xb2, 0x4800, 0x9000, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9900, 0x00, 4],
+                                ['simpleCopy', 0x9c, 0x7200+3*8, 0x0020, 0x8, 'rom', 'bgPalettes'],
+
+                                ['simpleCopy', 0xb2, 0x4a00, 0x9200, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9907, 0x20, 5],
+                                ['simpleCopy', 0x9c, 0x7200+3*8, 0x0028, 0x8, 'rom', 'bgPalettes'],
+
+                                ['simpleCopy', 0xb2, 0x4c00, 0x9400, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9980, 0x40, 6],
+                                ['simpleCopy', 0x9c, 0x7200+3*8, 0x0030, 0x8, 'rom', 'bgPalettes'],
+
+                                ['simpleCopy', 0xb2, 0x4e00, 0x9600, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9987, 0x60, 7],
+                                ['simpleCopy', 0x9c, 0x7200+3*8, 0x0038, 0x8, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                            colsShown: 14,
+                            canvasWidth: 14 * 8,
+                            rowsShown: 16,
+                            canvasHeight: 16 * 8,
+                        },
+                        {
+                            name: "Events 6",
+                            sources: [
+                                ['simpleCopy', 0xb2, 0x5000, 0x8800, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9800, 0x80, 0],
+                                ['simpleCopy', 0x9c, 0x7200+3*8, 0x0000, 0x8, 'rom', 'bgPalettes'],
+
+                                ['simpleCopy', 0xb2, 0x5200, 0x8a00, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9807, 0xa0, 1],
+                                ['simpleCopy', 0x9c, 0x7200+3*8, 0x0008, 0x8, 'rom', 'bgPalettes'],
+
+                                ['simpleCopy', 0xb2, 0x5400, 0x8c00, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9880, 0xc0, 2],
+                                ['simpleCopy', 0x9c, 0x7200+3*8, 0x0010, 0x8, 'rom', 'bgPalettes'],
+
+                                ['simpleCopy', 0xb2, 0x5600, 0x8e00, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9887, 0xe0, 3],
+                                ['simpleCopy', 0x9c, 0x7200+3*8, 0x0018, 0x8, 'rom', 'bgPalettes'],
+
+                                ['simpleCopy', 0xb2, 0x5800, 0x9000, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9900, 0x00, 4],
+                                ['simpleCopy', 0x9c, 0x7200+3*8, 0x0020, 0x8, 'rom', 'bgPalettes'],
+
+                                ['simpleCopy', 0xb2, 0x5a00, 0x9200, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9907, 0x20, 5],
+                                ['simpleCopy', 0x9c, 0x7200+3*8, 0x0028, 0x8, 'rom', 'bgPalettes'],
+
+                                ['simpleCopy', 0xb2, 0x5c00, 0x9400, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9980, 0x40, 6],
+                                ['simpleCopy', 0x9c, 0x7200+0*8, 0x0030, 0x8, 'rom', 'bgPalettes'],
+
+                                ['simpleCopy', 0xb2, 0x5e00, 0x9600, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9987, 0x60, 7],
+                                ['simpleCopy', 0x9c, 0x7200+1*8, 0x0038, 0x8, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                            colsShown: 14,
+                            canvasWidth: 14 * 8,
+                            rowsShown: 16,
+                            canvasHeight: 16 * 8,
+                        },
+                        {
+                            name: "Events 7",
+                            sources: [
+                                ['simpleCopy', 0xb2, 0x6000, 0x8800, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9800, 0x80, 0],
+                                ['simpleCopy', 0x9c, 0x7200+2*8, 0x0000, 0x8, 'rom', 'bgPalettes'],
+
+                                ['simpleCopy', 0xb2, 0x6200, 0x8a00, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9807, 0xa0, 1],
+                                ['simpleCopy', 0x9c, 0x7200+0*8, 0x0008, 0x8, 'rom', 'bgPalettes'],
+
+                                ['simpleCopy', 0xb2, 0x6400, 0x8c00, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9880, 0xc0, 2],
+                                ['simpleCopy', 0x9c, 0x7200+0*8, 0x0010, 0x8, 'rom', 'bgPalettes'],
+
+                                ['simpleCopy', 0xb2, 0x6600, 0x8e00, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9887, 0xe0, 3],
+                                ['simpleCopy', 0x9c, 0x7200+0*8, 0x0018, 0x8, 'rom', 'bgPalettes'],
+
+                                ['simpleCopy', 0xb2, 0x7400, 0x9000, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9900, 0x00, 4],
+                                ['simpleCopy', 0x9c, 0x7200+1*8, 0x0020, 0x8, 'rom', 'bgPalettes'],
+
+                                ['simpleCopy', 0xb2, 0x7600, 0x9200, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9907, 0x20, 5],
+                                ['simpleCopy', 0x9c, 0x7200+2*8, 0x0028, 0x8, 'rom', 'bgPalettes'],
+
+                                ['simpleCopy', 0xb2, 0x7800, 0x9400, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9980, 0x40, 6],
+                                ['simpleCopy', 0x9c, 0x7200+6*8, 0x0030, 0x8, 'rom', 'bgPalettes'],
+
+                                ['simpleCopy', 0xb2, 0x7200, 0x9600, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9987, 0x60, 7],
+                                ['simpleCopy', 0x9c, 0x7200+3*8, 0x0038, 0x8, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                            colsShown: 14,
+                            canvasWidth: 14 * 8,
+                            rowsShown: 16,
+                            canvasHeight: 16 * 8,
+                        },
+                        {
+                            name: "Events 8",
+                            sources: [
+                                ['simpleCopy', 0xb2, 0x7000, 0x8800, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9800, 0x80, 0],
+                                ['simpleCopy', 0x9c, 0x7200+3*8, 0x0000, 0x8, 'rom', 'bgPalettes'],
+
+                                ['simpleCopy', 0xb2, 0x6e00, 0x8a00, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9807, 0xa0, 1],
+                                ['simpleCopy', 0x9c, 0x7200+3*8, 0x0008, 0x8, 'rom', 'bgPalettes'],
+
+                                ['simpleCopy', 0xb2, 0x6c00, 0x8c00, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9880, 0xc0, 2],
+                                ['simpleCopy', 0x9c, 0x7200+3*8, 0x0010, 0x8, 'rom', 'bgPalettes'],
+
+                                ['simpleCopy', 0xb2, 0x6a00, 0x8e00, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9887, 0xe0, 3],
+                                ['simpleCopy', 0x9c, 0x7200+3*8, 0x0018, 0x8, 'rom', 'bgPalettes'],
+
+                                ['simpleCopy', 0xb2, 0x6800, 0x9000, 0x200],
+                                ['eventBox', 0x00, 0x0000, 0x9900, 0x00, 4],
+                                ['simpleCopy', 0x9c, 0x7200+3*8, 0x0020, 0x8, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                            colsShown: 14,
+                            canvasWidth: 14 * 8,
+                            rowsShown: 16,
+                            canvasHeight: 16 * 8,
+                        },
+                        {
+                            name: "Sky color 0",
+                            sources: [
+                                ['skyColor', 7, 0x4000, 0x0000],
+                            ],
+                            isSkyColor: true,
+                        },
+                        {
+                            name: "Sky color 1",
+                            sources: [
+                                ['skyColor', 7, 0x4040, 0x0000],
+                            ],
+                            isSkyColor: true,
+                        },
+                        {
+                            name: "Sky color 2",
+                            sources: [
+                                ['skyColor', 7, 0x4080, 0x0000],
+                            ],
+                            isSkyColor: true,
+                        },
+                        {
+                            name: "Sky color 3",
+                            sources: [
+                                ['skyColor', 7, 0x40c0, 0x0000],
+                            ],
+                            isSkyColor: true,
+                        },
+                        {
+                            name: "Sky color 4",
+                            sources: [
+                                ['skyColor', 7, 0x4100, 0x0000],
+                            ],
+                            isSkyColor: true,
+                        },
+                        {
+                            name: "Sky color 5",
+                            sources: [
+                                ['skyColor', 7, 0x42c0, 0x0000],
+                            ],
+                            isSkyColor: true,
+                        },
+                        {
+                            name: "Sky color 6",
+                            sources: [
+                                ['skyColor', 7, 0x4140, 0x0000],
+                            ],
+                            isSkyColor: true,
+                        },
+                        {
+                            name: "Sky color 7",
+                            sources: [
+                                ['skyColor', 7, 0x4180, 0x0000],
+                            ],
+                            isSkyColor: true,
+                        },
+                        {
+                            name: "Sky color 8",
+                            sources: [
+                                ['skyColor', 7, 0x41c0, 0x0000],
+                            ],
+                            isSkyColor: true,
+                        },
+                        {
+                            name: "Sky color 9",
+                            sources: [
+                                ['skyColor', 7, 0x4200, 0x0000],
+                            ],
+                            isSkyColor: true,
+                        },
+                        {
+                            name: "Sky color 10",
+                            sources: [
+                                ['skyColor', 7, 0x4240, 0x0000],
+                            ],
+                            isSkyColor: true,
+                        },
+                        {
+                            name: "Sky color 11",
+                            sources: [
+                                ['skyColor', 7, 0x4280, 0x0000],
+                            ],
+                            isSkyColor: true,
+                        },
+                        /*{
+                            name: "Trainline Selection Scrolling text 1",
+                            sources: [
+                                ['simpleCopy', 0xc7, 0x5f40, 0x0000, 0x1800, 'rom', 'vram1'],
+                                ['simpleCopy', 0xc7, 0x4a40, 0x8000, 0x1800],
+                                
+                                ['scrollCopy', 0x0a, 0x5821, 0x9800, 0x3f-0x12],
+                                ['scrollCopy', 0x0a, 0x56d9, 0x9880, 0x3a-0x12],
+                                ['scrollCopy', 0x0a, 0x58d5, 0x9980, 0x40-0x12],
+                                ['scrollCopy', 0x0a, 0x5b2d, 0x9980, 0x56-0x12],
+                                ['scrollCopy', 0x0a, 0x5c3d, 0x9a40, 0x58-0x12],
+                                ['scrollCopy', 0x0a, 0x598d, 0x9b00, 0x42-0x12],
+                                ['scrollCopy', 0x0a, 0x5779, 0x9b80, 0x3c-0x12],
+                                
+                                ['simpleCopy', 0xcd, 0x7300, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                            colsShown: 32,
+                            canvasWidth: 32 * 8,
+                            rowsShown: 32,
+                            canvasHeight: 32 * 8,
+                        },
+                        {
+                            name: "Trainline Selection Scrolling text 2",
+                            sources: [
+                                ['simpleCopy', 0xcd, 0x5000, 0x0000, 0x1800, 'rom', 'vram1'],
+                                ['simpleCopy', 0xcd, 0x4000, 0x8800, 0x1000],
+
+                                //['scrollCopy', 0x0a, 0x5779, 0x9a80, 0x3c-0x12],
+                                ['scrollCopy', 0x0a, 0x5a4d, 0x9800, 0x4a-0x12],
+                                //['scrollCopy', 0x0a, 0x58d5, 0x9940, 0x40-0x12],
+                                
+                                ['simpleCopy', 0xcd, 0x7300, 0x0000, 0x40, 'rom', 'bgPalettes'],
+                            ],
+                            isGBC: true,
+                            colsShown: 32,
+                            canvasWidth: 32 * 8,
+                        },*/
+                    ],
+                },
+                methods: {
+                    animate: function(btnName) {
+                        for (let btn in this.animateBtns) {
+                            let affected = this.animateBtns[btn];
+                            if (btn === btnName) {
+                                for (let i = 0; i < affected.length; i++) {
+                                    let screen = this.screenMap[affected[i]];
+                                    screen.screenSpec.animateIdx = screen.screenSpec.animateStartIdx;
+                                    screen.canAnimate = true;
+                                    screen.drawScreen();
+                                }
+                            } else {
+                                for (let i = 0; i < affected.length; i++) {
+                                    this.screenMap[affected[i]].canAnimate = false;
+                                }
+                            }
+                        }
+                    },
+
+                    loadData: function() {
+                        fetch('/densha2.gbc')
+                            .then(response => checkStatus(response) && response.arrayBuffer())
+                            .then(buffer => {
+                                this.uint8view = new Uint8Array(buffer);
+
+                                setTimeout(this.loadScreens, 5);
+                            });
+                    },
+
+                    wordIn: function(addr) {
+                        return wordIn(this.uint8view, addr);
+                    },
+
+                    loadScreens: function() {
+                        if (this.uint8view === null) return;
+
+                        let newScreenMap = {};
+                        for (let screenData of this.screens) {
+                            let screenName = screenData.name;
+                            let screen = new Screen(screenData, this.uint8view);
+                            newScreenMap[screenName] = screen;
+                            screen.drawScreen();
+                        }
+                        this.screenMap = newScreenMap;
+                    },
+                },
+                computed: {},
+            });
+
+            app.loadData();
+
+            function checkStatus(response) {
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status} - ${response.statusText}`);
+                }
+                return response;
+            }
+        </script>
+    </body>
+</html>

@@ -1,0 +1,7 @@
+*.gbc
+*.map
+*.sav
+*.sym
+
+__pycache__/
+build/
